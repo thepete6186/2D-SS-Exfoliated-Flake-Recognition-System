@@ -15,10 +15,6 @@ Desktop.ini
 # macOS
 .DS_Store
 
-# Dataset images (large files)
-dataset/
-old_experiments/*/dataset/
-
 # Generated results (large PNG files)
 old_experiments/*/results/
 hsv-pipeline-semi/results/
