@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Dataset images (large files)
+dataset/
+old_experiments/*/dataset/
+
+# Generated results (large PNG files)
+old_experiments/*/results/
+hsv-pipeline-semi/results/
+
+# IDE/workspace files
+*.code-workspace
