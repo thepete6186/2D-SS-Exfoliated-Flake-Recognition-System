@@ -1,0 +1,25 @@
+Flake Detection Statistics
+==========================
+
+Technique: v070
+V threshold: 0.7, S threshold: 0.2
+Hue range: 20.0-70.0
+Min area: 50px
+Open radius: 2, Close radius: 4
+
+Total flake area: 272000 px
+Total image area: 19961856 px
+Coverage: 1.36%
+Detected components: 7
+
+Area stats: min=51, max=271422, mean=38857.1, median=72.0
+
+  #   Area(px)  Width Height    CenterX    CenterY
+-------------------------------------------------------
+  1         52     10     15     2196.5      871.0
+  2     271422    555   1214     2574.4     1690.0
+  3        135      7     31     2233.4     1305.0
+  4        210     16     28     2221.6     1360.4
+  5         58      8      9     2513.2     1409.1
+  6         72     11     16     2471.8     1847.0
+  7         51     13     11     4231.0     2434.2

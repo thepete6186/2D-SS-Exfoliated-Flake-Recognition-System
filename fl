@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""
+run_histogram.py — Combined HSV histogram peak detection across ALL images.
+
+Approach:
+  1. Load ALL images in sample2, accumulate H, S, V histograms across all of them.
+  2. Find peaks in the 3 combined histograms (combined H, combined S, combined V).
+  3. Save the 3 combined histograms with peaks marked.
+  4. Process each image using the combined peaks to generate probability maps.
+"""
+
+import sys
+import cv2
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from flake_detection.preprocess import preprocess
+from flake_detection.config import DEFAULTS
+
+
+def find_histogram_peaks(hist, n_peaks=2, min_separation=5):
+    """
+    Find the top N peaks in a 1D histogram.
+    Returns list of (bin_value, count).
+    """
+    hist_smooth = cv2.GaussianBlur(hist.reshape(-1, 1), (1, 5), 0).flatten()
+
+    peaks = []
+    for i in range(1, len(hist_smooth) - 1):
+        if hist_smooth[i] >= hist_smooth[i - 1] and hist_smooth[i] >= hist_smooth[i + 1]:
+            peaks.append((i, hist_smooth[i]))
+
+    peaks.sort(key=lambda x: x[1], reverse=True)
+
+    selected = []
+    for p in peaks:
+        too_close = False
+        for s in selected:
+            if abs(p[0] - s[0]) < min_separation:
+                too_close = True
+                break
+        if not too_close:
+            selected.append(p)
+        if len(selected) >= n_peaks:
+            break
+
+    return selected
+
+
+def save_combined_histograms(h_hist, s_hist, v_hist, h_peaks, s_peaks, v_peaks, out_path):
+    """Save the 3 combined histograms with peaks marked."""
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+    channels = [
+        ("Combined Hue (0-180) — all images", h_hist, h_peaks, axes[0]),
+        ("Combined Saturation (0-255) — all images", s_hist, s_peaks, axes[1]),
+        ("Combined Value (0-255) — all images", v_hist, v_peaks, axes[2]),
+    ]
+
+    colors = ['red', 'blue']
+    labels = ['Substrate (peak 1)', 'Flake (peak 2)']
+
+    for title, hist, peaks, ax in channels:
+        ax.plot(hist, color='gray', linewidth=0.8)
+        ax.set_title(title)
+        ax.set_xlabel('Bin')
+        ax.set_ylabel('Count')
+
+        for i, (peak_val, peak_count) in enumerate(peaks[:2]):
+            color = colors[i] if i < len(colors) else 'green'
+            label = labels[i] if i < len(labels) else f'Peak {i+1}'
+            ax.axvline(x=peak_val, color=color, linestyle='--', linewidth=1.5, label=label)
+            ax.annotate(f'{label}\n(val={peak_val})',
+                        xy=(peak_val, peak_count),
+                        xytext=(peak_val + 10, peak_count * 0.9),
+                        arrowprops=dict(arrowstyle='->', color=color),
+                        fontsize=8, color=color)
+
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150)
+    plt.close()
+
+
+def main():
+    script_dir = Path(__file__).resolve().parent
+    input_dir = script_dir.parent / "dataset" / "sample2"
+    output_dir = script_dir / "results"
+
+    image_paths = sorted(input_dir.glob("*.jpg"))
+    if not image_paths:
+        print(f"No images found in {input_dir}")
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cfg = DEFAULTS.copy()
+
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Found {len(image_paths)} images")
+    print()
+
+    # ── PASS 1: Accumulate combined histograms across ALL images ──
+    print("Pass 1: Accumulating combined H/S/V histograms...")
+    h_hist_combined = np.zeros(180, dtype=np.float32)
+    s_hist_combined = np.zeros(256, dtype=np.float32)
+    v_hist_combined = np.zeros(256, dtype=np.float32)
+
+    for img_path in image_paths:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Resize for speed
+        h, w = rgb.shape[:2]
+        rgb = cv2.resize(rgb, (int(w * 0.5), int(h * 0.5)))
+
+        # Preprocess
+        rgb_denoised, gray_flat, _ = preprocess(rgb, cfg)
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(rgb_denoised, cv2.COLOR_RGB2HSV)
+        h, s, v = cv2.split(hsv)
+
+        # Accumulate histograms
+        h_hist_combined += cv2.calcHist([h], [0], None, [180], [0, 180]).flatten()
+        s_hist_combined += cv2.calcHist([s], [0], None, [256], [0, 256]).flatten()
+        v_hist_combined += cv2.calcHist([v], [0], None, [256], [0, 256]).flatten()
+
+        print(f"  accumulated: {img_path.name}")
+
+    # Find peaks in the combined histograms
+    h_peaks = find_histogram_peaks(h_hist_combined, n_peaks=2, min_separation=5)
+    s_peaks = find_histogram_peaks(s_hist_combined, n_peaks=2, min_separation=5)
+    v_peaks = find_histogram_peaks(v_hist_combined, n_peaks=2, min_separation=5)
+
+    sub_h = h_peaks[0][0] if len(h_peaks) > 0 else 0
+    flake_h = h_peaks[1][0] if len(h_peaks) > 1 else sub_h
+    sub_s = s_peaks[0][0] if len(s_peaks) > 0 else 0
+    flake_s = s_peaks[1][0] if len(s_peaks) > 1 else sub_s
+    sub_v = v_peaks[0][0] if len(v_peaks) > 0 else 0
+    flake_v = v_peaks[1][0] if len(v_peaks) > 1 else sub_v
+
+    print(f"\nCombined peaks:")
+    print(f"  Substrate: H={sub_h} S={sub_s} V={sub_v}")
+    print(f"  Flake:     H={flake_h} S={flake_s} V={flake_v}")
+    print()
+
+    # Save the 3 combined histograms
+    hist_path = output_dir / "combined_histograms.png"
+    save_combined_histograms(h_hist_combined, s_hist_combined, v_hist_combined,
+                             h_peaks, s_peaks, v_peaks, hist_path)
+    print(f"Saved combined histograms: {hist_path.name}")
+    print()
+
+    # ── PASS 2: Process each image using the combined peaks ──
+    print("Pass 2: Generating probability maps using combined peaks...")
+    for img_path in image_paths:
+        print(f"  Processing: {img_path.name} ...", end=" ", flush=True)
+
+        img = cv2.imread(str(img_path))
+        if img is None:
+            print("SKIP")
+            continue
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Resize for speed
+        h, w = rgb.shape[:2]
+        rgb = cv2.resize(rgb, (int(w * 0.5), int(h * 0.5)))
+
+        # Preprocess
+        rgb_denoised, gray_flat, _ = preprocess(rgb, cfg)
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(rgb_denoised, cv2.COLOR_RGB2HSV)
+        h, s, v = cv2.split(hsv)
+
+        h_f = h.astype(np.float32)
+        s_f = s.astype(np.float32)
+        v_f = v.astype(np.float32)
+
+        # Distance to substrate peak (circular for hue)
+        d_sub_h = np.minimum(np.abs(h_f - sub_h), 180.0 - np.abs(h_f - sub_h)) / 90.0
+        d_sub_s = np.abs(s_f - sub_s) / 128.0
+        d_sub_v = np.abs(v_f - sub_v) / 128.0
+        d_sub = np.sqrt(d_sub_h ** 2 + d_sub_s ** 2 + d_sub_v ** 2)
+
+        # Distance to flake peak (circular for hue)
+        d_flake_h = np.minimum(np.abs(h_f - flake_h), 180.0 - np.abs(h_f - flake_h)) / 90.0
+        d_flake_s = np.abs(s_f - flake_s) / 128.0
+        d_flake_v = np.abs(v_f - flake_v) / 128.0
+        d_flake = np.sqrt(d_flake_h ** 2 + d_flake_s ** 2 + d_flake_v ** 2)
+
+        # Nearest peak: P = d_sub / (d_sub + d_flake)
+        total = d_sub + d_flake
+        prob = np.where(total > 0, d_sub / total, 0.0).astype(np.float32)
+
+        # Save probability map
+        stem = img_path.stem
+        prob_uint8 = (prob * 255).astype(np.uint8)
+        prob_path = output_dir / f"{stem}_probability.png"
+        cv2.imwrite(str(prob_path), prob_uint8)
+
+        print(f"done. -> {prob_path.name}")
+
+    print("\nAll done.")
+
+
+if __name__ == "__main__":
+    main()
