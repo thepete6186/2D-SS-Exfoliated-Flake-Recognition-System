@@ -15,9 +15,19 @@ Desktop.ini
 # macOS
 .DS_Store
 
+# Large data files
+dataset/
+dataset/dataset
+old_experiments/*/dataset/
+old_experiments/*/dataset/dataset
+backup/
+
 # Generated results (large PNG files)
 old_experiments/*/results/
 hsv-pipeline-semi/results/
+
+# This is just big
+transfer-stage-control
 
 # IDE/workspace files
 *.code-workspace
