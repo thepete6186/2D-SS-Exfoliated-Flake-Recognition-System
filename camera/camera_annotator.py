@@ -10,6 +10,8 @@ Standalone tkinter app for:
 - Adjust camera settings (exposure, gain)
 """
 
+
+
 import sys
 import json
 import logging
