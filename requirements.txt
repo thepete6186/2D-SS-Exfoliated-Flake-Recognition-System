@@ -1,0 +1,14 @@
+# Core dependencies for the 2D-SS-Exfoliated-Flake-Recognition-System
+# Install with: pip install -r requirements.txt
+
+# --- Camera & Image Processing ---
+opencv-python>=4.8.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# --- HSV Pipeline (semi-supervised detection) ---
+scipy>=1.10.0
+matplotlib>=3.7.0
+
+# --- Stage Control (Zolix ZC300, SigmaKoki) ---
+pyserial>=3.5
