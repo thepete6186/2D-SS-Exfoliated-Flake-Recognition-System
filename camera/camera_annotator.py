@@ -3,7 +3,7 @@
 Camera Annotator - Live camera view with click annotation and HSV recording.
 
 Standalone tkinter app for:
-- Live camera feed from Zeiss XiCam 208
+- Live camera feed from Zeiss XiCam 208 (USB camera via OpenCV)
 - Click to mark points (records pixel coordinates + HSV values)
 - Auto-detect substrate HSV
 - Save/load points with HSV to JSON
@@ -169,7 +169,7 @@ class CameraAnnotator:
         settings_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # Exposure
-        ttk.Label(settings_frame, text="Exposure (µs):").pack(anchor=tk.W, padx=5)
+        ttk.Label(settings_frame, text="Exposure (us):").pack(anchor=tk.W, padx=5)
         self.exposure_var = tk.DoubleVar(value=10000.0)
         exposure_slider = ttk.Scale(
             settings_frame, from_=100, to=100000,
@@ -177,7 +177,7 @@ class CameraAnnotator:
             command=self._on_exposure_change
         )
         exposure_slider.pack(padx=5, pady=2, fill=tk.X)
-        self.exposure_label = ttk.Label(settings_frame, text="10000 µs")
+        self.exposure_label = ttk.Label(settings_frame, text="10000 us")
         self.exposure_label.pack(anchor=tk.E, padx=5)
 
         # Gain
@@ -235,15 +235,22 @@ class CameraAnnotator:
     def _connect_camera(self):
         """Connect to camera."""
         try:
-            self.camera = ZeissCamera(use_sdk=True)
-            if self.camera.connect():
+            # Try camera indices 0, 1, 2 to find the USB camera
+            self.camera = None
+            for idx in range(3):
+                cam = ZeissCamera(camera_index=idx)
+                if cam.connect():
+                    self.camera = cam
+                    break
+
+            if self.camera is not None:
                 self.camera_connected = True
                 self.btn_connect.config(text="Disconnect")
                 info = self.camera.get_camera_info()
                 self.status_bar.config(text=f"Connected: {info.get('name', 'Unknown')}")
                 logger.info("Camera connected")
             else:
-                messagebox.showerror("Error", "Failed to connect to camera")
+                messagebox.showerror("Error", "Failed to connect to camera (tried indices 0-2)")
                 self.camera = None
         except Exception as e:
             messagebox.showerror("Error", f"Camera connection failed: {e}")
@@ -523,7 +530,7 @@ class CameraAnnotator:
     def _on_exposure_change(self, value):
         """Handle exposure slider change."""
         exposure_us = float(value)
-        self.exposure_label.config(text=f"{exposure_us:.0f} µs")
+        self.exposure_label.config(text=f"{exposure_us:.0f} us")
 
         if self.camera:
             self.camera.set_exposure(exposure_us)
