@@ -1,10 +1,15 @@
 """
-Zeiss XiCam 208 Color Camera Driver
-=====================================
+Camera Driver for USB Camera (Zeiss XiCam 208 via OpenCV)
+=========================================================
 
-Camera interface for Zeiss XiCam 208 Color scientific camera.
+Simple USB camera driver using OpenCV's VideoCapture.
+The Zeiss XiCam 208 appears as a standard USB video device.
 
-Tries Zeiss SDK first, falls back to OpenCV VideoCapture if SDK not available.
+Usage:
+    cam = Camera()
+    cam.connect()
+    rgb = cam.capture()
+    cam.disconnect()
 """
 
 import numpy as np
@@ -23,24 +28,23 @@ class CameraError(Exception):
 
 class ZeissCamera:
     """
-    Camera interface for Zeiss XiCam 208 Color.
-    
+    USB camera driver using OpenCV VideoCapture.
+
+    The Zeiss XiCam 208 is a USB3 Vision camera that appears as a
+    standard USB video device. OpenCV can access it directly.
+
     Parameters
     ----------
-    use_sdk : bool
-        Try to use Zeiss SDK first (default: True). Falls back to OpenCV if not available.
     camera_index : int
-        Camera device index for OpenCV fallback (default: 0).
+        Camera device index (default: 0). Try 0, 1, 2 if not found.
     """
-    
-    def __init__(self, use_sdk: bool = True, camera_index: int = 0):
-        self.use_sdk = use_sdk
+
+    def __init__(self, camera_index: int = 0):
         self.camera_index = camera_index
-        self.camera = None
-        self.sdk_camera = None
+        self.cap: Optional[cv2.VideoCapture] = None
         self.connected = False
-        self.backend = "none"
-        
+        self.backend = "opencv"
+
         # Default camera settings
         self.settings: Dict[str, Any] = {
             'exposure_us': 10000.0,  # 10ms default
@@ -49,206 +53,101 @@ class ZeissCamera:
             'resolution': (5472, 3648),  # Max resolution, adjustable
             'pixel_format': 'RGB',
         }
-        
-        # Try to import Zeiss SDK
-        self._zeiss_sdk_available = False
-        if self.use_sdk:
-            try:
-                # Try common Zeiss SDK module names
-                # Actual import depends on SDK version
-                import zeiss.microscopy as zm
-                self._zeiss_sdk = zm
-                self._zeiss_sdk_available = True
-                logger.info("Zeiss SDK found")
-            except ImportError:
-                try:
-                    # Alternative: try pyzeiss or other names
-                    import pyzeiss
-                    self._zeiss_sdk = pyzeiss
-                    self._zeiss_sdk_available = True
-                    logger.info("Zeiss SDK found (pyzeiss)")
-                except ImportError:
-                    logger.warning("Zeiss SDK not found, will use OpenCV fallback")
-                    self._zeiss_sdk_available = False
-    
+
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
-    
+
     def connect(self) -> bool:
         """
-        Initialize camera connection.
-        
+        Open the camera device.
+
         Returns
         -------
         bool
             True if connected successfully, False otherwise.
         """
-        if self._zeiss_sdk_available:
-            return self._connect_sdk()
-        else:
-            logger.info("Using OpenCV fallback")
-            return self._connect_opencv()
-    
-    def _connect_sdk(self) -> bool:
-        """Connect using Zeiss Microscopy SDK."""
         try:
-            # Find available cameras
-            cameras = self._zeiss_sdk.Camera.list_cameras()
-            if not cameras:
-                logger.error("No Zeiss cameras found")
+            self.cap = cv2.VideoCapture(self.camera_index)
+
+            if not self.cap.isOpened():
+                logger.error(f"Could not open camera at index {self.camera_index}")
+                self.cap = None
                 return False
-            
-            # Use first available camera
-            self.sdk_camera = cameras[0]
-            self.sdk_camera.open()
-            
-            # Apply default settings
-            self._apply_sdk_settings()
-            
+
+            # Try to set resolution
+            self._set_resolution()
+
+            # Try to set exposure (may not work for all cameras)
+            self._apply_settings()
+
             self.connected = True
-            self.backend = "zeiss_sdk"
-            logger.info(f"Connected to Zeiss camera: {self.sdk_camera.name}")
+            logger.info(f"Connected to camera {self.camera_index}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Zeiss SDK connection failed: {e}")
-            logger.info("Falling back to OpenCV")
-            self._zeiss_sdk_available = False
-            return self._connect_opencv()
-    
-    def _connect_opencv(self) -> bool:
-        """Fallback: connect using OpenCV VideoCapture."""
-        try:
-            # Try multiple camera indices
-            for idx in range(5):
-                cap = cv2.VideoCapture(idx)
-                if cap.isOpened():
-                    # Try to read a frame to verify it works
-                    ret, frame = cap.read()
-                    if ret:
-                        # Check if this looks like a high-res camera
-                        height = frame.shape[0]
-                        logger.info(f"Camera {idx}: {frame.shape}")
-                        
-                        self.camera = cap
-                        self.connected = True
-                        self.backend = "opencv"
-                        self.camera_index = idx
-                        
-                        # Try to set resolution
-                        self._set_opencv_resolution()
-                        
-                        logger.info(f"Connected to camera {idx} via OpenCV")
-                        return True
-                    cap.release()
-            
-            logger.error("No suitable camera found")
+            logger.error(f"Camera connection failed: {e}")
+            self.cap = None
             return False
-            
-        except Exception as e:
-            logger.error(f"OpenCV camera connection failed: {e}")
-            return False
-    
-    def _set_opencv_resolution(self):
-        """Try to set camera resolution via OpenCV."""
-        if self.camera is None:
-            return
-        
-        width, height = self.settings['resolution']
-        
-        # Try to set resolution
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        
-        # Read actual resolution
-        actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        logger.info(f"Camera resolution: {actual_width}x{actual_height}")
-        self.settings['resolution'] = (actual_width, actual_height)
-    
+
     def disconnect(self) -> None:
-        """Release camera resources."""
-        if self.sdk_camera is not None:
+        """Release the camera device."""
+        if self.cap is not None:
             try:
-                self.sdk_camera.close()
+                self.cap.release()
             except Exception:
                 pass
-            self.sdk_camera = None
-        
-        if self.camera is not None:
-            try:
-                self.camera.release()
-            except Exception:
-                pass
-            self.camera = None
-        
+            self.cap = None
+
         self.connected = False
-        self.backend = "none"
         logger.info("Camera disconnected")
-    
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected and self.cap is not None and self.cap.isOpened()
+
     # ------------------------------------------------------------------
     # Capture
     # ------------------------------------------------------------------
-    
+
     def capture(self) -> Optional[np.ndarray]:
         """
-        Capture single image.
-        
+        Capture a single frame.
+
         Returns
         -------
         np.ndarray or None
             RGB image as numpy array (H, W, 3), or None on failure.
         """
-        if not self.connected:
+        if not self.is_connected:
             logger.error("Camera not connected")
             return None
-        
+
         try:
-            if self.backend == "zeiss_sdk":
-                return self._capture_sdk()
-            else:
-                return self._capture_opencv()
+            ret, frame = self.cap.read()
+            if not ret:
+                logger.error("Failed to capture frame")
+                return None
+
+            # Convert BGR (OpenCV default) to RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return rgb
+
         except Exception as e:
             logger.error(f"Capture failed: {e}")
             return None
-    
-    def _capture_sdk(self) -> np.ndarray:
-        """Capture using Zeiss SDK."""
-        # Actual SDK call - adjust based on actual API
-        image = self.sdk_camera.capture_image()
-        
-        # Convert to numpy array (adjust based on SDK)
-        # Typically returns RGB already
-        rgb = np.array(image)
-        
-        return rgb
-    
-    def _capture_opencv(self) -> np.ndarray:
-        """Capture using OpenCV."""
-        if self.camera is None:
-            raise CameraError("Camera not initialized")
-        
-        ret, frame = self.camera.read()
-        if not ret:
-            raise CameraError("Failed to capture frame")
-        
-        # Convert BGR (OpenCV default) to RGB
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return rgb
-    
+
     def capture_to_file(self, output_path: Path, format: str = "png") -> bool:
         """
         Capture image and save to file.
-        
+
         Parameters
         ----------
         output_path : Path
             Output file path.
         format : str
             Image format: 'png' (lossless) or 'jpg' (compressed).
-        
+
         Returns
         -------
         bool
@@ -257,73 +156,68 @@ class ZeissCamera:
         rgb = self.capture()
         if rgb is None:
             return False
-        
+
         # Convert RGB to BGR for OpenCV imwrite
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        
-        # Set compression quality for JPEG
-        if format.lower() == 'jpg' or format.lower() == 'jpeg':
+
+        if format.lower() in ('jpg', 'jpeg'):
             cv2.imwrite(str(output_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
         else:
             cv2.imwrite(str(output_path), bgr)
-        
+
         logger.info(f"Saved image to {output_path}")
         return True
-    
+
     # ------------------------------------------------------------------
     # Camera Settings
     # ------------------------------------------------------------------
-    
+
     def set_exposure(self, exposure_us: float) -> None:
         """
         Set exposure time.
-        
+
         Parameters
         ----------
         exposure_us : float
             Exposure time in microseconds.
         """
         self.settings['exposure_us'] = exposure_us
-        
-        if not self.connected:
+
+        if not self.is_connected:
             return
-        
+
         try:
-            if self.backend == "zeiss_sdk":
-                self.sdk_camera.exposure = exposure_us
-            else:
-                # OpenCV: exposure control varies by camera
-                # Often in camera-specific units (not microseconds)
-                self.camera.set(cv2.CAP_PROP_EXPOSURE, exposure_us / 1000.0)
+            # OpenCV exposure is in some camera-specific units
+            # For many cameras, it's in 1/100000 seconds (10 µs units)
+            # So exposure_us / 10 gives the OpenCV value
+            exposure_val = exposure_us / 10.0
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_val)
         except Exception as e:
             logger.warning(f"Failed to set exposure: {e}")
-    
+
     def set_gain(self, gain_db: float) -> None:
         """
         Set camera gain.
-        
+
         Parameters
         ----------
         gain_db : float
             Gain in decibels (dB).
         """
         self.settings['gain_db'] = gain_db
-        
-        if not self.connected:
+
+        if not self.is_connected:
             return
-        
+
         try:
-            if self.backend == "zeiss_sdk":
-                self.sdk_camera.gain = gain_db
-            else:
-                self.camera.set(cv2.CAP_PROP_GAIN, gain_db)
+            self.cap.set(cv2.CAP_PROP_GAIN, gain_db)
         except Exception as e:
             logger.warning(f"Failed to set gain: {e}")
-    
+
     def set_resolution(self, width: int, height: int) -> None:
         """
         Set camera resolution.
-        
+
         Parameters
         ----------
         width : int
@@ -332,74 +226,73 @@ class ZeissCamera:
             Image height in pixels.
         """
         self.settings['resolution'] = (width, height)
-        
-        if not self.connected:
+
+        if not self.is_connected:
             return
-        
+
         try:
-            if self.backend == "opencv":
-                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                self._set_opencv_resolution()
-            else:
-                logger.warning("Resolution setting not implemented for Zeiss SDK")
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self._set_resolution()
         except Exception as e:
             logger.warning(f"Failed to set resolution: {e}")
-    
-    def get_settings(self) -> Dict[str, Any]:
-        """
-        Get current camera settings.
-        
-        Returns
-        -------
-        dict
-            Dictionary of current settings.
-        """
-        return dict(self.settings)
-    
-    def _apply_sdk_settings(self) -> None:
-        """Apply current settings to Zeiss SDK camera."""
-        if self.backend != "zeiss_sdk" or not self.connected:
+
+    def _set_resolution(self) -> None:
+        """Apply resolution settings and read back actual values."""
+        if self.cap is None:
             return
-        
+
+        width, height = self.settings['resolution']
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        # Read actual resolution
+        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        self.settings['resolution'] = (actual_width, actual_height)
+        logger.info(f"Camera resolution: {actual_width}x{actual_height}")
+
+    def _apply_settings(self) -> None:
+        """Apply current settings to camera."""
+        if not self.is_connected:
+            return
+
         try:
             self.set_exposure(self.settings['exposure_us'])
             self.set_gain(self.settings['gain_db'])
         except Exception as e:
             logger.warning(f"Failed to apply settings: {e}")
-    
+
     # ------------------------------------------------------------------
     # Camera Info
     # ------------------------------------------------------------------
-    
+
     def get_camera_info(self) -> Dict[str, Any]:
         """
         Get camera information.
-        
+
         Returns
         -------
         dict
-            Camera name, model, resolution, etc.
+            Camera name, model, resolution, backend.
         """
         info = {
             'backend': self.backend,
             'connected': self.connected,
             'resolution': self.settings['resolution'],
         }
-        
-        if self.backend == "zeiss_sdk" and self.sdk_camera:
-            try:
-                info['name'] = self.sdk_camera.name
-                info['model'] = getattr(self.sdk_camera, 'model', 'Unknown')
-            except Exception:
-                info['name'] = 'Zeiss Camera'
-                info['model'] = 'Unknown'
+
+        if self.is_connected:
+            info['name'] = f"USB Camera {self.camera_index}"
+            info['model'] = 'XiCam 208 (USB)'
+            info['backend'] = 'opencv'
         else:
-            info['name'] = f"Camera {self.camera_index}"
+            info['name'] = 'Unknown'
             info['model'] = 'Unknown'
-        
+
         return info
-    
+
     def __repr__(self) -> str:
         status = "connected" if self.connected else "disconnected"
-        return f"ZeissCamera(backend={self.backend}, {status})"
+        return f"ZeissCamera(index={self.camera_index}, {status})"
