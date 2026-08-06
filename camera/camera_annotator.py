@@ -28,6 +28,7 @@ from PIL import Image, ImageTk
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from camera.zeiss_camera import ZeissCamera, CameraError
+from camera.mmcore_camera import MMCoreCamera
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class Point:
         self.x = x
         self.y = y
         self.hsv = hsv  # (H, S, V) tuple or None
-        self.label = label or f"Point {len(self.points) + 1}"
+        self.label = label or "Point"
 
     def to_dict(self):
         return {
@@ -78,6 +79,8 @@ class CameraAnnotator:
         # Camera
         self.camera: Optional[ZeissCamera] = None
         self.camera_connected = False
+        self.camera_backend = "auto"  # "auto", "opencv", "mmcore"
+        self.mm_config_path = None  # Path to Micro-Manager config
 
         # Points
         self.points: List[Point] = []
@@ -152,6 +155,28 @@ class CameraAnnotator:
 
         self.btn_connect = ttk.Button(conn_frame, text="Connect Camera", command=self._toggle_connection)
         self.btn_connect.pack(pady=5, padx=5, fill=tk.X)
+
+        # Backend selection
+        backend_frame = ttk.Frame(conn_frame)
+        backend_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(backend_frame, text="Backend:").pack(side=tk.LEFT)
+        self.backend_var = tk.StringVar(value="auto")
+        backend_combo = ttk.Combobox(
+            backend_frame, textvariable=self.backend_var, state="readonly",
+            values=("auto", "gentl", "opencv", "micro-manager"),
+            width=18
+        )
+        backend_combo.pack(side=tk.LEFT, padx=5)
+        backend_combo.bind("<<ComboboxSelected>>", self._on_backend_change)
+
+        self.btn_load_image = ttk.Button(conn_frame, text="Load Image from File", command=self._load_image_file)
+        self.btn_load_image.pack(pady=5, padx=5, fill=tk.X)
+        
+        # Watch folder mode for Labscope integration
+        self.watch_folder = None
+        self.watch_interval = 1000  # Check every 1 second
+        self.btn_watch_folder = ttk.Button(conn_frame, text="Watch Labscope Folder", command=self._toggle_watch_folder)
+        self.btn_watch_folder.pack(pady=5, padx=5, fill=tk.X)
 
         # Substrate HSV section
         substrate_frame = ttk.LabelFrame(parent, text="Substrate HSV")
@@ -234,29 +259,114 @@ class CameraAnnotator:
         else:
             self._connect_camera()
 
+    def _on_backend_change(self, event=None):
+        """Handle backend selection change."""
+        backend = self.backend_var.get()
+        if backend == "auto":
+            self.camera_backend = "auto"
+        elif backend == "gentl":
+            self.camera_backend = "gentl"
+        elif backend == "opencv":
+            self.camera_backend = "opencv"
+        elif backend == "micro-manager":
+            self.camera_backend = "mmcore"
+
+        # If camera is currently connected, reconnect with new backend
+        if self.camera_connected:
+            self._disconnect_camera()
+            self.status_bar.config(
+                text=f"Backend set to {self.camera_backend}. Camera disconnected."
+            )
+
     def _connect_camera(self):
         """Connect to camera."""
+        backend = self.camera_backend
         try:
-            # Try camera indices 0, 1, 2 to find the USB camera
             self.camera = None
-            for idx in range(3):
-                cam = ZeissCamera(camera_index=idx)
+
+            # Try GenTL first (correct backend for Axiocam 208)
+            if backend in ("auto", "gentl"):
+                for idx in range(3):
+                    cam = ZeissCamera(camera_index=idx, backend="gentl")
+                    if cam.connect():
+                        self.camera = cam
+                        self.camera_connected = True
+                        self.btn_connect.config(text="Disconnect")
+                        info = self.camera.get_camera_info()
+                        self.status_bar.config(
+                            text=f"Connected: {info.get('name', 'Unknown')} "
+                                 f"({info.get('backend', '')})"
+                        )
+                        logger.info("Camera connected via GenTL")
+                        return
+                    if backend == "gentl":
+                        break
+
+            # Try Micro-Manager/pymmcore second
+            if backend in ("auto", "mmcore"):
+                cam = MMCoreCamera(camera_index=0, mm_config_path=self.mm_config_path)
                 if cam.connect():
                     self.camera = cam
-                    break
+                    self.camera_connected = True
+                    self.btn_connect.config(text="Disconnect")
+                    info = self.camera.get_camera_info()
+                    self.status_bar.config(
+                        text=f"Connected: {info.get('name', 'Unknown')} "
+                             f"(Micro-Manager: {info.get('backend', '')})"
+                    )
+                    logger.info("Camera connected via Micro-Manager")
+                    return
+                elif backend == "mmcore":
+                    messagebox.showerror(
+                        "Micro-Manager Connection Failed",
+                        "Could not connect to camera via Micro-Manager.\n\n"
+                        "Troubleshooting:\n"
+                        "  1. pip install pymmcore pymmcore-plus\n"
+                        "  2. Install Micro-Manager 2.0 (https://micro-manager.org)\n"
+                        "  3. Ensure Micro-Manager has Zeiss Axiocam adapter\n"
+                        "  4. Set MICRO_MANAGER_PATH environment variable:\n"
+                        "     setx MICRO_MANAGER_PATH \"C:\\Program Files\\Micro-Manager-2.0\"\n"
+                        "  5. Make sure camera is plugged into USB 3 and not used\n"
+                        "     by another app (e.g. Zeiss ZEN, Labscope)"
+                    )
+                    return
 
-            if self.camera is not None:
-                self.camera_connected = True
-                self.btn_connect.config(text="Disconnect")
-                info = self.camera.get_camera_info()
-                self.status_bar.config(text=f"Connected: {info.get('name', 'Unknown')}")
-                logger.info("Camera connected")
-            else:
-                messagebox.showerror("Error", "Failed to connect to camera (tried indices 0-2)")
-                self.camera = None
+            # Try OpenCV last (won't work for Axiocam 208 but keep for compatibility)
+            if backend in ("auto", "opencv"):
+                for idx in range(3):
+                    cam = ZeissCamera(camera_index=idx, backend="opencv")
+                    if cam.connect():
+                        self.camera = cam
+                        self.camera_connected = True
+                        self.btn_connect.config(text="Disconnect")
+                        info = self.camera.get_camera_info()
+                        self.status_bar.config(
+                            text=f"Connected: {info.get('name', 'Unknown')} "
+                                 f"({info.get('backend', '')})"
+                        )
+                        logger.info("Camera connected via OpenCV")
+                        return
+
+            # If we got here, connection failed
+            messagebox.showerror(
+                "Camera Connection Failed",
+                "Could not connect to the Zeiss Axiocam 208.\n\n"
+                "REQUIRED: Physical USB reconnection\n"
+                "The camera driver has a stale handle that can only be fixed by:\n"
+                "  1. Unplug the camera USB cable\n"
+                "  2. Wait 2 seconds\n"
+                "  3. Plug it back in\n"
+                "  4. Wait 5 seconds for Windows to detect it\n"
+                "  5. Click 'Connect Camera' again\n\n"
+                "Note: Software reset cannot fix this - physical reconnection is required.\n\n"
+                "For offline work, use 'Load Image from File' instead."
+            )
+            self.camera = None
+            self.camera_connected = False
         except Exception as e:
             messagebox.showerror("Error", f"Camera connection failed: {e}")
             self.camera = None
+            self.camera_connected = False
 
     def _disconnect_camera(self):
         """Disconnect camera."""
@@ -271,6 +381,102 @@ class CameraAnnotator:
         self.btn_connect.config(text="Connect Camera")
         self.status_bar.config(text="Status: Disconnected")
         logger.info("Camera disconnected")
+
+    def _load_image_file(self):
+        """Load a still image from disk for offline annotation."""
+        file_path = filedialog.askopenfilename(
+            title="Open Image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+
+        try:
+            # Disconnect live camera if connected
+            if self.camera_connected:
+                self._disconnect_camera()
+
+            # Read with OpenCV (BGR) and convert to RGB
+            bgr = cv2.imread(file_path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                messagebox.showerror("Error", f"Could not read image: {file_path}")
+                return
+
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self.current_image = rgb
+            self.fps = 0.0
+
+            # Update display once
+            self._update_display()
+            self.status_bar.config(
+                text=f"Image: {Path(file_path).name} | "
+                     f"{rgb.shape[1]}x{rgb.shape[0]} | Points: {len(self.points)}"
+            )
+            logger.info(f"Loaded image from {file_path} ({rgb.shape[1]}x{rgb.shape[0]})")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image: {e}")
+
+    def _toggle_watch_folder(self):
+        """Toggle folder watch mode for Labscope integration."""
+        if self.watch_folder:
+            # Stop watching
+            self.watch_folder = None
+            self.btn_watch_folder.config(text="Watch Labscope Folder")
+            self.status_bar.config(text="Folder watch stopped")
+            return
+
+        # Select folder
+        folder = filedialog.askdirectory(title="Select Labscope Save Folder")
+        if not folder:
+            return
+
+        self.watch_folder = folder
+        self.btn_watch_folder.config(text="Stop Watching Folder")
+        self.status_bar.config(text=f"Watching: {folder}")
+        logger.info(f"Watching folder: {folder}")
+        
+        # Start watching
+        self._watch_folder()
+
+    def _watch_folder(self):
+        """Check folder for new images and load them."""
+        if not self.watch_folder:
+            return
+
+        try:
+            # Look for image files
+            extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff']
+            files = []
+            for ext in extensions:
+                files.extend(Path(self.watch_folder).glob(ext))
+            
+            # Sort by modification time, get most recent
+            if files:
+                latest = max(files, key=lambda p: p.stat().st_mtime)
+                
+                # Check if it's different from current image
+                if not hasattr(self, '_last_watched_file') or self._last_watched_file != str(latest):
+                    self._last_watched_file = str(latest)
+                    
+                    # Load the image
+                    bgr = cv2.imread(str(latest), cv2.IMREAD_COLOR)
+                    if bgr is not None:
+                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                        self.current_image = rgb
+                        self._update_display()
+                        self.status_bar.config(
+                            text=f"Labscope: {latest.name} | "
+                                 f"{rgb.shape[1]}x{rgb.shape[0]} | Points: {len(self.points)}"
+                        )
+                        logger.info(f"Loaded from Labscope: {latest.name}")
+        except Exception as e:
+            logger.error(f"Folder watch error: {e}")
+
+        # Schedule next check
+        self.root.after(self.watch_interval, self._watch_folder)
 
     # ------------------------------------------------------------------
     # Frame Update Loop

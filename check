@@ -1,0 +1,105 @@
+"""Check for Zeiss services and reset the camera USB device."""
+import subprocess
+import os
+import time
+
+print("=== Zeiss Services ===")
+try:
+    result = subprocess.run(
+        ["sc", "query", "type=", "service", "state=", "all"],
+        capture_output=True, text=True, timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    lines = result.stdout.split('\n')
+    for i, line in enumerate(lines):
+        if 'zeiss' in line.lower() or 'axio' in line.lower() or 'labscope' in line.lower() or 'zen' in line.lower():
+            # Print service name and state
+            for j in range(max(0, i-1), min(len(lines), i+3)):
+                print(f"  {lines[j].strip()}")
+            print("  ---")
+except Exception as e:
+    print(f"  sc query failed: {e}")
+
+print("\n=== Zeiss Processes ===")
+try:
+    result = subprocess.run(
+        ["tasklist", "/fo", "csv"],
+        capture_output=True, text=True, timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    for line in result.stdout.split('\n'):
+        low = line.lower()
+        if any(x in low for x in ['zeiss', 'labscope', 'zen', 'axio', 'mmstudio', 'micro-manager']):
+            print(f"  {line.strip()}")
+except Exception as e:
+    print(f"  tasklist failed: {e}")
+
+print("\n=== libusb0 device status ===")
+try:
+    result = subprocess.run(
+        ["pnputil", "/enum-devices", "/instanceid", "USB\\VID_0758&PID_6002\\5&112bc8d3&0&19"],
+        capture_output=True, text=True, timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    print(result.stdout)
+except Exception as e:
+    print(f"  pnputil failed: {e}")
+
+print("\n=== Try to reset the USB device via pyusb ===")
+try:
+    import usb.core
+    import usb.util
+    
+    dev = usb.core.find(idVendor=0x0758, idProduct=0x6002)
+    if dev is not None:
+        print(f"  Found device: {dev.product}")
+        try:
+            # Try to reset the device
+            dev.reset()
+            print("  Device reset successful!")
+            time.sleep(2)
+        except Exception as e:
+            print(f"  Device reset failed: {e}")
+        
+        # Re-find after reset
+        dev2 = usb.core.find(idVendor=0x0758, idProduct=0x6002)
+        if dev2 is not None:
+            print(f"  Device still present after reset: {dev2.product}")
+        else:
+            print("  Device disappeared after reset!")
+    else:
+        print("  Device not found!")
+except Exception as e:
+    print(f"  pyusb error: {e}")
+
+print("\n=== Check if camera is accessible via libusb0 ===")
+try:
+    import usb.core
+    import usb.util
+    
+    dev = usb.core.find(idVendor=0x0758, idProduct=0x6002)
+    if dev is not None:
+        # Try to claim interface and do a control transfer
+        try:
+            usb.util.claim_interface(dev, 0)
+            print("  Interface claimed successfully")
+            
+            # Try a standard control transfer to get device descriptor
+            try:
+                desc = dev.ctrl_transfer(
+                    bmRequestType=0x80,
+                    bRequest=0x06,
+                    wValue=0x0100,
+                    wIndex=0,
+                    data_or_wLength=18,
+                    timeout=2000
+                )
+                print(f"  Device descriptor: {bytes(desc).hex()}")
+            except Exception as e:
+                print(f"  Control transfer failed: {e}")
+            
+            usb.util.release_interface(dev, 0)
+        except Exception as e:
+            print(f"  Interface claim failed: {e}")
+except Exception as e:
+    print(f"  pyusb error: {e}")

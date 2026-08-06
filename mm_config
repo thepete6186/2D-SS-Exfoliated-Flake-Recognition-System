@@ -1,0 +1,101 @@
+"""Configure Micro-Manager AxioCam adapter properly."""
+import os, sys
+
+print("=== Micro-Manager AxioCam Adapter Configuration ===\n")
+
+from pymmcore_plus import CMMCorePlus
+mm = CMMCorePlus()
+
+mm_path = os.path.join(
+    os.path.expanduser("~"),
+    "AppData", "Local", "pymmcore-plus", "pymmcore-plus", "mm",
+    "Micro-Manager_2.0.3_20260805"
+)
+print(f"MM path: {mm_path}")
+mm.setDeviceAdapterSearchPaths([mm_path])
+
+# Load the AxioCam adapter
+axio_devs = mm.getAvailableDevices("AxioCam")
+print(f"AxioCam devices: {axio_devs}")
+
+if not axio_devs:
+    print("No AxioCam devices found!")
+    sys.exit(1)
+
+dev_name = axio_devs[0]
+print(f"\nLoading device: {dev_name}")
+mm.loadDevice(dev_name, "AxioCam", dev_name)
+
+# List all properties BEFORE initialization
+print("\n=== Properties before initialization ===")
+try:
+    props = mm.getDevicePropertyNames(dev_name)
+    print(f"  {len(props)} properties:")
+    for p in props:
+        try:
+            val = mm.getProperty(dev_name, p)
+            print(f"    {p} = {val}")
+        except Exception as e:
+            print(f"    {p} = (error: {e})")
+except Exception as e:
+    print(f"  Could not get properties: {e}")
+
+# Try to set camera model/type properties
+print("\n=== Setting camera configuration ===")
+# Common AxioCam properties to try
+config_props = [
+    ("CameraType", "Axiocam 208"),
+    ("CameraModel", "Axiocam 208"),
+    ("Model", "Axiocam 208"),
+    ("CameraName", "Axiocam 208"),
+    ("DeviceType", "Axiocam 208"),
+]
+
+for prop, val in config_props:
+    try:
+        mm.setProperty(dev_name, prop, val)
+        print(f"  Set {prop} = {val} OK")
+    except Exception as e:
+        print(f"  {prop}: {e}")
+
+# Try to initialize
+print("\n=== Initializing device ===")
+try:
+    mm.initializeDevice(dev_name)
+    print("  Initialized OK!")
+except Exception as e:
+    print(f"  Initialize failed: {e}")
+
+# List properties AFTER initialization
+print("\n=== Properties after initialization ===")
+try:
+    props = mm.getDevicePropertyNames(dev_name)
+    print(f"  {len(props)} properties:")
+    for p in props:
+        try:
+            val = mm.getProperty(dev_name, p)
+            print(f"    {p} = {val}")
+        except Exception as e:
+            print(f"    {p} = (error: {e})")
+except Exception as e:
+    print(f"  Could not get properties: {e}")
+
+# Try setting camera device
+print("\n=== Setting camera device ===")
+try:
+    mm.setCameraDevice(dev_name)
+    print(f"  Camera device: {mm.getCameraDevice()}")
+except Exception as e:
+    print(f"  Failed: {e}")
+
+# Try to get image dimensions
+print("\n=== Image dimensions ===")
+try:
+    w = mm.getImageWidth()
+    h = mm.getImageHeight()
+    print(f"  {w}x{h}")
+except Exception as e:
+    print(f"  Failed: {e}")
+
+mm.unloadAllDevices()
+print("\nDone!")

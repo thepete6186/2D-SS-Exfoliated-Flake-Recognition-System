@@ -6,6 +6,10 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 pillow>=10.0.0
 
+# --- Micro-Manager (pymmcore) for Axiocam 208 ---
+pymmcore>=2.0.0
+pymmcore-plus>=1.0.0
+
 # --- HSV Pipeline (semi-supervised detection) ---
 scipy>=1.10.0
 matplotlib>=3.7.0
