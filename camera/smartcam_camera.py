@@ -91,6 +91,12 @@ class SmartCamCamera:
     # Native 12MP resolution of the Axiocam 208 Color
     EXPECTED_RESOLUTION = (4608, 3600)
 
+    # Actual observed live format: 1920x960 12-bit packed Bayer
+    # (1.5 bytes/pixel, 2 pixels per 3 bytes).
+    # The 16,588,800-byte buffer contains 6 frames stacked vertically.
+    LIVE_RESOLUTION = (1920, 960)
+    LIVE_BYTES = 1920 * 960 * 3 // 2  # 2,764,800
+
     def __init__(self, camera_index: int = 0):
         self.camera_index = camera_index
         self.connected = False
@@ -240,37 +246,60 @@ class SmartCamCamera:
 
     def _detect_format(self, raw: np.ndarray) -> Dict[str, Any]:
         """
-        Detect the buffer format ONCE using a small center crop.
+        Detect the buffer format ONCE.
         Returns a cached format dict used by _decode() on every later frame.
         """
         n = int(raw.size)
         raw_bytes = raw.tobytes()
 
-        # ---- PRIMARY: 8-bit Bayer at native 4608x3600 (12MP color) ----
-        if n == self.EXPECTED_RESOLUTION[0] * self.EXPECTED_RESOLUTION[1]:
-            w, h = self.EXPECTED_RESOLUTION
-            img = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(h, w)
-            # center crop for fast detection (~400x400)
-            cy, cx = h // 2, w // 2
-            crop = img[cy - 200:cy + 200, cx - 200:cx + 200]
+        # ---- PRIMARY: 1920x1080 12-bit packed Bayer (observed live) ----
+        # The buffer may contain multiple frames. Use only the FIRST one
+        # (the rest is padding/empty).
+        w, h = self.LIVE_RESOLUTION
+        frame_bytes = self.LIVE_BYTES
+        if n >= frame_bytes:
+            # Use the first complete frame in the buffer
+            offset = 0
+            content = np.frombuffer(raw_bytes[offset:offset + frame_bytes], dtype=np.uint8)
+            # Unpack 12-bit packed: 3 bytes -> 2 pixels
+            b = content.reshape(-1, 3)
+            p0 = (b[:, 0].astype(np.uint16) << 4) | (b[:, 1].astype(np.uint16) >> 4)
+            p1 = ((b[:, 1].astype(np.uint16) & 0x0F) << 8) | b[:, 2].astype(np.uint16)
+            pixels = np.empty(b.shape[0] * 2, dtype=np.uint16)
+            pixels[0::2] = p0
+            pixels[1::2] = p1
+            img12 = pixels.reshape(h, w)
+            # Scale 12-bit -> 8-bit
+            scaled = (img12.astype(np.float32) / 4095.0 * 255.0).astype(np.uint8)
+            # Detect Bayer pattern on the full frame.
+            # For dark scenes (where all patterns score similarly), use a
+            # channel-separation heuristic: the correct pattern maximizes
+            # the difference between the brightest and darkest channels.
             best_code, best_name, best_score = None, None, -1.0
             for code, name in _BAYER_CODES:
                 try:
-                    rgb = cv2.cvtColor(crop, code)
+                    rgb = cv2.cvtColor(scaled, code)
                     s = self._score_rgb(rgb)
+                    # Secondary heuristic: prefer patterns where R and B
+                    # channels differ more (helps with pink/red substrates)
+                    r = rgb[..., 0].astype(np.float32)
+                    g = rgb[..., 1].astype(np.float32)
+                    b = rgb[..., 2].astype(np.float32)
+                    rb_diff = float(np.mean(np.abs(r - b)))
+                    s += rb_diff * 2.0  # bonus for R/B separation
                     if s > best_score:
                         best_score, best_code, best_name = s, code, name
                 except Exception:
                     continue
             fmt = {
-                "kind": "bayer8",
+                "kind": "bayer12",
                 "w": w,
                 "h": h,
                 "code": best_code if best_code is not None else _BAYER_CODES[0][0],
                 "name": best_name if best_name is not None else _BAYER_CODES[0][1],
             }
             self.settings["resolution"] = (w, h)
-            logger.info("Detected format: 8-bit Bayer %s at %sx%s (score=%.2f)",
+            logger.info("Detected format: 12-bit packed Bayer %s at %sx%s (score=%.2f)",
                         fmt["name"], w, h, best_score)
             return fmt
 
@@ -297,6 +326,52 @@ class SmartCamCamera:
             self._fmt = self._detect_format(raw)
         fmt = self._fmt
         raw_bytes = raw.tobytes()
+
+        if fmt["kind"] == "bayer12":
+            w = fmt["w"]
+            # The buffer contains multiple frames stacked vertically.
+            # Try different frame heights and Bayer patterns to find the
+            # correct combination.
+            best_rgb = None
+            best_score = -1.0
+            best_info = "none"
+            for h in [960, 1080, 540, 480, 360, 270, 240]:
+                frame_bytes = w * h * 3 // 2
+                if raw.size < frame_bytes:
+                    continue
+                # Try this frame height with all Bayer patterns
+                content = np.frombuffer(raw_bytes[:frame_bytes], dtype=np.uint8)
+                b = content.reshape(-1, 3)
+                p0 = (b[:, 0].astype(np.uint16) << 4) | (b[:, 1].astype(np.uint16) >> 4)
+                p1 = ((b[:, 1].astype(np.uint16) & 0x0F) << 8) | b[:, 2].astype(np.uint16)
+                pixels = np.empty(b.shape[0] * 2, dtype=np.uint16)
+                pixels[0::2] = p0
+                pixels[1::2] = p1
+                img12 = pixels.reshape(h, w)
+                # Simple linear stretch 12-bit -> 8-bit
+                scaled = (img12.astype(np.float32) / 4095.0 * 255.0).astype(np.uint8)
+                bayer8 = np.clip(scaled, 0, 255).astype(np.uint8)
+                for code, name in _BAYER_CODES:
+                    try:
+                        rgb = cv2.cvtColor(bayer8, code)
+                        r_mean = float(np.mean(rgb[..., 0]))
+                        g_mean = float(np.mean(rgb[..., 1]))
+                        b_mean = float(np.mean(rgb[..., 2]))
+                        # Natural images have balanced channels
+                        means = np.array([r_mean, g_mean, b_mean])
+                        balance = 1.0 / (1.0 + np.std(means))
+                        color = float(np.std(rgb))
+                        score = balance * 20.0 + color
+                        if score > best_score:
+                            best_score = score
+                            best_rgb = rgb
+                            best_info = f"h={h} pattern={name}"
+                    except Exception:
+                        continue
+            logger.info(f"Selected: {best_info} (score={best_score:.2f})")
+            if best_rgb is None:
+                return np.zeros((960, w, 3), dtype=np.uint8)
+            return best_rgb
 
         if fmt["kind"] == "bayer8":
             w, h = fmt["w"], fmt["h"]
@@ -422,14 +497,45 @@ class SmartCamCamera:
     # Camera Settings
     # ------------------------------------------------------------------
     def set_exposure(self, exposure_us: float) -> None:
-        """Set exposure time in microseconds (not yet wired to DLL)."""
+        """Set exposure time in microseconds via SmartCamApi SetParameterValue."""
         self.settings["exposure_ms"] = exposure_us / 1000.0
-        logger.warning("SmartCamApi: set_exposure not yet implemented in DLL bindings")
+        if not self.is_connected or self._dll is None:
+            return
+        try:
+            # Try common SmartCamApi exposure parameter IDs
+            # These are typical Zeiss SmartCam parameter IDs
+            for param_id in [9, 10, 11, 12, 13, 14]:
+                rc = self._dll.ApiCam_SetParameterValue(
+                    self._camera_handle, param_id, ctypes.c_double(exposure_us / 1000.0)
+                )
+                if rc == 0:
+                    logger.info(f"Set exposure to {exposure_us} us via param {param_id}")
+                    return
+                elif rc not in (5, 13):  # 5=not readable, 13=not writable
+                    logger.debug(f"SetParameterValue({param_id}) rc={rc}")
+            logger.warning("SmartCamApi: could not set exposure (parameter ID unknown)")
+        except Exception as e:
+            logger.warning(f"SmartCamApi: set_exposure failed: {e}")
 
     def set_gain(self, gain_db: float) -> None:
-        """Set camera gain in decibels (not yet wired to DLL)."""
+        """Set camera gain in decibels via SmartCamApi SetParameterValue."""
         self.settings["gain"] = gain_db
-        logger.warning("SmartCamApi: set_gain not yet implemented in DLL bindings")
+        if not self.is_connected or self._dll is None:
+            return
+        try:
+            # Try common SmartCamApi gain parameter IDs
+            for param_id in [2, 3, 4, 5, 6, 7, 8]:
+                rc = self._dll.ApiCam_SetParameterValue(
+                    self._camera_handle, param_id, ctypes.c_double(gain_db)
+                )
+                if rc == 0:
+                    logger.info(f"Set gain to {gain_db} dB via param {param_id}")
+                    return
+                elif rc not in (5, 13):
+                    logger.debug(f"SetParameterValue({param_id}) rc={rc}")
+            logger.warning("SmartCamApi: could not set gain (parameter ID unknown)")
+        except Exception as e:
+            logger.warning(f"SmartCamApi: set_gain failed: {e}")
 
     def disconnect(self) -> None:
         """Release the camera device."""
