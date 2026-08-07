@@ -8,13 +8,18 @@ Standalone tkinter app for:
 - Auto-detect substrate HSV
 - Save/load points with HSV to JSON
 - Adjust camera settings (exposure, gain)
+
+Performance:
+  - Camera capture runs on a background thread (never blocks the GUI).
+  - Frames are downscaled with cv2 (fast) before display.
+  - The window opens maximized.
 """
-
-
 
 import sys
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -29,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from camera.zeiss_camera import ZeissCamera, CameraError
 from camera.mmcore_camera import MMCoreCamera
+from camera.smartcam_camera import SmartCamCamera
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,7 +69,7 @@ class CameraAnnotator:
     Live camera viewer with point annotation and HSV recording.
 
     Features:
-    - Live camera feed
+    - Live camera feed (background capture thread)
     - Click to add points (records HSV at click location)
     - Right-click to remove last point
     - Auto-detect substrate HSV
@@ -75,12 +81,20 @@ class CameraAnnotator:
         self.root = root
         self.root.title("Camera Annotator - XiCam 208")
         self.root.geometry("1200x800")
+        self.root.state("zoomed")  # maximize on Windows
 
         # Camera
-        self.camera: Optional[ZeissCamera] = None
+        self.camera = None
         self.camera_connected = False
-        self.camera_backend = "auto"  # "auto", "opencv", "mmcore"
+        self.camera_backend = "auto"  # "auto", "gentl", "opencv", "mmcore", "smartcam"
         self.mm_config_path = None  # Path to Micro-Manager config
+
+        # Background capture thread state
+        self._capture_thread = None
+        self._capture_stop = threading.Event()
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._capture_fps = 0.0
 
         # Points
         self.points: List[Point] = []
@@ -163,7 +177,7 @@ class CameraAnnotator:
         self.backend_var = tk.StringVar(value="auto")
         backend_combo = ttk.Combobox(
             backend_frame, textvariable=self.backend_var, state="readonly",
-            values=("auto", "gentl", "opencv", "micro-manager"),
+            values=("auto", "gentl", "opencv", "micro-manager", "smartcam"),
             width=18
         )
         backend_combo.pack(side=tk.LEFT, padx=5)
@@ -171,7 +185,7 @@ class CameraAnnotator:
 
         self.btn_load_image = ttk.Button(conn_frame, text="Load Image from File", command=self._load_image_file)
         self.btn_load_image.pack(pady=5, padx=5, fill=tk.X)
-        
+
         # Watch folder mode for Labscope integration
         self.watch_folder = None
         self.watch_interval = 1000  # Check every 1 second
@@ -270,6 +284,8 @@ class CameraAnnotator:
             self.camera_backend = "opencv"
         elif backend == "micro-manager":
             self.camera_backend = "mmcore"
+        elif backend == "smartcam":
+            self.camera_backend = "smartcam"
 
         # If camera is currently connected, reconnect with new backend
         if self.camera_connected:
@@ -298,11 +314,39 @@ class CameraAnnotator:
                                  f"({info.get('backend', '')})"
                         )
                         logger.info("Camera connected via GenTL")
+                        self._start_capture_thread()
                         return
                     if backend == "gentl":
                         break
 
-            # Try Micro-Manager/pymmcore second
+            # Try SmartCamApi third (native Zeiss SDK - works without GenTL)
+            if backend in ("auto", "smartcam"):
+                cam = SmartCamCamera(camera_index=0)
+                if cam.connect():
+                    self.camera = cam
+                    self.camera_connected = True
+                    self.btn_connect.config(text="Disconnect")
+                    info = self.camera.get_camera_info()
+                    self.status_bar.config(
+                        text=f"Connected: {info.get('name', 'Unknown')} "
+                             f"(SmartCamApi: {info.get('backend', '')})"
+                    )
+                    logger.info("Camera connected via SmartCamApi")
+                    self._start_capture_thread()
+                    return
+                elif backend == "smartcam":
+                    messagebox.showerror(
+                        "SmartCamApi Connection Failed",
+                        "Could not connect to camera via SmartCamApi.\n\n"
+                        "Troubleshooting:\n"
+                        "  1. Ensure SmartCamApi.dll is installed (comes with Labscope)\n"
+                        "  2. Ensure libusb0 driver is installed for the camera\n"
+                        "  3. Make sure camera is not held by another app\n"
+                        "  4. Try unplugging and replugging the camera"
+                    )
+                    return
+
+            # Try Micro-Manager/pymmcore fourth
             if backend in ("auto", "mmcore"):
                 cam = MMCoreCamera(camera_index=0, mm_config_path=self.mm_config_path)
                 if cam.connect():
@@ -315,6 +359,7 @@ class CameraAnnotator:
                              f"(Micro-Manager: {info.get('backend', '')})"
                     )
                     logger.info("Camera connected via Micro-Manager")
+                    self._start_capture_thread()
                     return
                 elif backend == "mmcore":
                     messagebox.showerror(
@@ -345,6 +390,7 @@ class CameraAnnotator:
                                  f"({info.get('backend', '')})"
                         )
                         logger.info("Camera connected via OpenCV")
+                        self._start_capture_thread()
                         return
 
             # If we got here, connection failed
@@ -370,6 +416,13 @@ class CameraAnnotator:
 
     def _disconnect_camera(self):
         """Disconnect camera."""
+        # Stop capture thread
+        self._capture_stop.set()
+        if self._capture_thread and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=2.0)
+        self._capture_thread = None
+        self._latest_frame = None
+
         if self.camera:
             try:
                 self.camera.disconnect()
@@ -437,7 +490,7 @@ class CameraAnnotator:
         self.btn_watch_folder.config(text="Stop Watching Folder")
         self.status_bar.config(text=f"Watching: {folder}")
         logger.info(f"Watching folder: {folder}")
-        
+
         # Start watching
         self._watch_folder()
 
@@ -452,15 +505,15 @@ class CameraAnnotator:
             files = []
             for ext in extensions:
                 files.extend(Path(self.watch_folder).glob(ext))
-            
+
             # Sort by modification time, get most recent
             if files:
                 latest = max(files, key=lambda p: p.stat().st_mtime)
-                
+
                 # Check if it's different from current image
                 if not hasattr(self, '_last_watched_file') or self._last_watched_file != str(latest):
                     self._last_watched_file = str(latest)
-                    
+
                     # Load the image
                     bgr = cv2.imread(str(latest), cv2.IMREAD_COLOR)
                     if bgr is not None:
@@ -479,31 +532,61 @@ class CameraAnnotator:
         self.root.after(self.watch_interval, self._watch_folder)
 
     # ------------------------------------------------------------------
+    # Background Capture Thread
+    # ------------------------------------------------------------------
+
+    def _start_capture_thread(self):
+        """Start the background capture thread."""
+        self._capture_stop.clear()
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+        logger.info("Capture thread started")
+
+    def _capture_loop(self):
+        """Continuously capture frames in the background."""
+        frame_count = 0
+        last_time = time.time()
+        while not self._capture_stop.is_set():
+            try:
+                data = self.camera.capture()
+                if data is not None:
+                    with self._frame_lock:
+                        self._latest_frame = data
+                    frame_count += 1
+                    now = time.time()
+                    if now - last_time >= 1.0:
+                        self._capture_fps = frame_count / (now - last_time)
+                        frame_count = 0
+                        last_time = now
+            except Exception as e:
+                logger.error(f"Capture thread error: {e}")
+                time.sleep(0.05)
+
+    # ------------------------------------------------------------------
     # Frame Update Loop
     # ------------------------------------------------------------------
 
     def _update_frame(self):
         """Update camera frame (called at ~30 fps)."""
         if self.camera_connected and self.camera:
-            try:
-                # Capture frame
-                rgb = self.camera.capture()
-                if rgb is not None:
-                    self.current_image = rgb
+            # Grab the latest frame from the background thread
+            with self._frame_lock:
+                frame = self._latest_frame
 
-                    # Update FPS
-                    self.frame_count += 1
-                    current_time = cv2.getTickCount()
-                    if self.frame_count == 1:
-                        self.last_fps_time = current_time
-                    elif current_time - self.last_fps_time >= cv2.getTickFrequency():
-                        self.fps = self.frame_count / ((current_time - self.last_fps_time) / cv2.getTickFrequency())
-                        self.frame_count = 0
+            if frame is not None:
+                self.current_image = frame
 
-                    # Update display
-                    self._update_display()
-            except Exception as e:
-                logger.error(f"Frame update error: {e}")
+                # Update FPS (display fps)
+                self.frame_count += 1
+                current_time = cv2.getTickCount()
+                if self.frame_count == 1:
+                    self.last_fps_time = current_time
+                elif current_time - self.last_fps_time >= cv2.getTickFrequency():
+                    self.fps = self.frame_count / ((current_time - self.last_fps_time) / cv2.getTickFrequency())
+                    self.frame_count = 0
+
+                # Update display
+                self._update_display()
 
         # Schedule next frame (~30 fps)
         self.root.after(33, self._update_frame)
@@ -520,17 +603,20 @@ class CameraAnnotator:
         if canvas_width <= 1 or canvas_height <= 1:
             return
 
-        # Convert numpy array to PIL Image
-        img = Image.fromarray(self.current_image)
+        img = self.current_image
+
+        # Fast downscale with cv2 (much faster than PIL for large frames)
+        img_h, img_w = img.shape[:2]
 
         # Apply zoom
         if self.zoom_level != 1.0:
-            new_width = int(img.width * self.zoom_level)
-            new_height = int(img.height * self.zoom_level)
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            target_w = int(img_w * self.zoom_level)
+            target_h = int(img_h * self.zoom_level)
+        else:
+            target_w, target_h = img_w, img_h
 
         # Fit to canvas (maintain aspect ratio)
-        img_ratio = img.width / img.height
+        img_ratio = target_w / target_h
         canvas_ratio = canvas_width / canvas_height
 
         if img_ratio > canvas_ratio:
@@ -540,11 +626,16 @@ class CameraAnnotator:
             display_height = canvas_height
             display_width = int(canvas_height * img_ratio)
 
-        # Resize for display
-        display_img = img.resize((display_width, display_height), Image.Resampling.LANCZOS)
+        # Downscale with cv2 (fast, INTER_AREA for downscale)
+        if display_width < img_w or display_height < img_h:
+            interp = cv2.INTER_AREA
+        else:
+            interp = cv2.INTER_LINEAR
+        display_img = cv2.resize(img, (display_width, display_height), interpolation=interp)
 
-        # Convert to PhotoImage
-        self.display_image = ImageTk.PhotoImage(display_img)
+        # Convert to PIL PhotoImage
+        pil_img = Image.fromarray(display_img)
+        self.display_image = ImageTk.PhotoImage(pil_img)
 
         # Clear canvas and draw image
         self.canvas.delete("all")
@@ -561,8 +652,8 @@ class CameraAnnotator:
             "y": y,
             "width": display_width,
             "height": display_height,
-            "orig_width": self.current_image.shape[1],
-            "orig_height": self.current_image.shape[0],
+            "orig_width": img_w,
+            "orig_height": img_h,
         }
 
         # Draw points
@@ -570,8 +661,8 @@ class CameraAnnotator:
 
         # Update status bar
         self.status_bar.config(
-            text=f"Connected | {self.current_image.shape[1]}x{self.current_image.shape[0]} | "
-                 f"{self.fps:.1f} fps | Points: {len(self.points)}"
+            text=f"Connected | {img_w}x{img_h} | "
+                 f"{self.fps:.1f} fps (capture {self._capture_fps:.1f}) | Points: {len(self.points)}"
         )
 
     def _draw_points(self):
