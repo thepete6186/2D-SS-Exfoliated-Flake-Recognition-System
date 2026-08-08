@@ -4,15 +4,27 @@ SmartCamApi.dll camera driver for Zeiss Axiocam 208 Color
 
 Native camera access via Zeiss's proprietary SmartCamApi.dll.
 
-The Axiocam 208 Color is a 12 MP (4608x3600) Bayer color camera.
-GetAcquisitionBufferSize returns 16588800 bytes = 4608*3600*1
-(8-bit Bayer CFA). The buffer is demosaiced to full-color RGB.
+The Axiocam 208 Color is a 4K (3840x2160, 8.3 MP) color camera.
+GetAcquisitionBufferSize returns 16,588,800 bytes = 3840*2160*2 —
+a single 4K frame at 2 bytes/pixel (12-bit Bayer data in 16-bit
+words, or possibly YUY2 depending on firmware). The buffer is
+decoded/demosaiced to full-color RGB.
+
+NOTE: 16,588,800 also factors as 4608*3600*1 and as 6*(1920*960*1.5);
+earlier revisions picked those interpretations. The 1920x960 packed
+read consumed only the first 2,764,800 bytes (the top ~360 of 2160
+sensor rows) with the wrong row stride, and its 3-byte unpack beat
+against the true 2-byte words with a 6-byte period — producing
+sheared, rainbow-striped garbage whose shape also changed frame to
+frame because the format search re-ran per frame. The format is now
+auto-detected once on the first judgeable frame by scoring every
+plausible decode for spatial coherence, then cached. Override with
+the SMARTCAM_PIXEL_FORMAT env var or the pixel_format constructor
+argument, e.g. "bayer16:rggb", "bayer16:bggr", "yuy2".
 
 Performance notes:
-  - Format detection (Bayer pattern) is done ONCE on the first frame
-    using a small center crop, then cached.
-  - Continuous acquisition is started once and reused, so we never
-    restart the acquisition per-frame (the main cause of slowness).
+  - Format detection runs ONCE, then every frame uses the cached
+    format (no per-frame searching).
   - capture() returns a full-resolution HxWx3 uint8 RGB array.
 
 Requirements:
@@ -24,7 +36,7 @@ Requirements:
 Usage:
     cam = SmartCamCamera()
     cam.connect()
-    rgb = cam.capture()   # np.ndarray (3600, 4608, 3) uint8 RGB, or None
+    rgb = cam.capture()   # np.ndarray (2160, 3840, 3) uint8 RGB, or None
     cam.disconnect()
 """
 
@@ -65,13 +77,30 @@ def _find_smartcam_dll() -> Optional[str]:
     return None
 
 
-# Bayer demosaic codes (OpenCV)
-_BAYER_CODES = [
-    (cv2.COLOR_BayerBG2RGB, "BGGR"),
-    (cv2.COLOR_BayerRG2RGB, "RGGB"),
-    (cv2.COLOR_BayerGR2RGB, "GRBG"),
-    (cv2.COLOR_BayerGB2RGB, "GBRG"),
-]
+# Literal CFA layout (top-left 2x2, row-major) -> OpenCV demosaic code.
+# OpenCV names its Bayer codes by the SECOND row/column, so literal RGGB
+# needs COLOR_BayerBG2RGB (verified empirically against synthetic CFAs).
+_LITERAL_BAYER_TO_CV2 = {
+    "rggb": cv2.COLOR_BayerBG2RGB,
+    "bggr": cv2.COLOR_BayerRG2RGB,
+    "grbg": cv2.COLOR_BayerGB2RGB,
+    "gbrg": cv2.COLOR_BayerGR2RGB,
+}
+
+# Bayer patterns that decode with identical spatial statistics but with
+# red and blue exchanged — indistinguishable without a scene prior.
+_RB_SWAPPED = {"rggb": "bggr", "bggr": "rggb", "grbg": "gbrg", "gbrg": "grbg"}
+
+
+def _unpack12(packed: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Unpack 12-bit packed data (3 bytes -> 2 pixels) to uint16 (h, w)."""
+    b = packed.reshape(-1, 3)
+    p0 = (b[:, 0].astype(np.uint16) << 4) | (b[:, 1].astype(np.uint16) >> 4)
+    p1 = ((b[:, 1].astype(np.uint16) & 0x0F) << 8) | b[:, 2].astype(np.uint16)
+    pixels = np.empty(b.shape[0] * 2, dtype=np.uint16)
+    pixels[0::2] = p0
+    pixels[1::2] = p1
+    return pixels.reshape(h, w)
 
 
 class SmartCamError(Exception):
@@ -88,19 +117,30 @@ class SmartCamCamera:
     dependency, full sensor resolution.
     """
 
-    # Native 12MP resolution of the Axiocam 208 Color
-    EXPECTED_RESOLUTION = (4608, 3600)
+    # Native 4K live resolution of the Axiocam 208 Color
+    EXPECTED_RESOLUTION = (3840, 2160)
 
-    # Actual observed live format: 1920x960 12-bit packed Bayer
-    # (1.5 bytes/pixel, 2 pixels per 3 bytes).
-    # The 16,588,800-byte buffer contains 6 frames stacked vertically.
-    LIVE_RESOLUTION = (1920, 960)
-    LIVE_BYTES = 1920 * 960 * 3 // 2  # 2,764,800
+    # Live buffer: one 3840x2160 frame at 2 bytes/pixel
+    LIVE_RESOLUTION = (3840, 2160)
+    LIVE_BYTES = 3840 * 2160 * 2  # 16,588,800
 
-    def __init__(self, camera_index: int = 0):
+    # Frames that are too flat to score before we give up and cache
+    # the default format anyway
+    _MAX_DETECT_ATTEMPTS = 30
+
+    def __init__(self, camera_index: int = 0,
+                 pixel_format: Optional[str] = None):
         self.camera_index = camera_index
         self.connected = False
         self.backend = "smartcam"
+
+        # Optional forced pixel format ("bayer16:rggb", "yuy2", ...).
+        # Falls back to the SMARTCAM_PIXEL_FORMAT environment variable.
+        self._forced_format_str = (
+            pixel_format or os.environ.get("SMARTCAM_PIXEL_FORMAT") or None
+        )
+        self._detect_attempts = 0
+        self._skip_detect = 0
 
         # DLL state
         self._dll = None
@@ -210,6 +250,18 @@ class SmartCamCamera:
             ctypes.c_int,
         ]
 
+        # Optional export — set_exposure/set_gain call this; without a
+        # prototype ctypes would marshal the c_double argument wrongly
+        try:
+            dll.ApiCam_SetParameterValue.restype = ctypes.c_int
+            dll.ApiCam_SetParameterValue.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_double,
+            ]
+        except AttributeError:
+            pass
+
     def _error_string(self, code: int) -> str:
         """Get error description for a code."""
         if self._dll is None:
@@ -228,183 +280,255 @@ class SmartCamCamera:
         return self._camera_handle.value
 
     # ------------------------------------------------------------------
-    # Format detection (cached) + fast decode
+    # Format detection (once, cached) + deterministic per-frame decode
     # ------------------------------------------------------------------
+
+    # A decode is accepted only if its high-frequency ratio is below this.
+    # Correct decodes of real scenes score ~0.01-0.3 (structure is much
+    # larger than pixel-to-pixel noise); misinterpretations score >~1
+    # because their "detail" IS pixel-to-pixel noise.
+    _ACCEPT_RATIO = 0.5
+
     @staticmethod
-    def _score_rgb(rgb: np.ndarray) -> float:
-        """Higher = more colorful/likely a real image. Fast on small crops."""
+    def _u16_shift(arr16: np.ndarray) -> int:
+        """Bits to right-shift a 16-bit container down to 8 bits for THIS
+        frame. 12-bit right-aligned data (max 4095) needs >>4; left-aligned
+        or true 16-bit data needs >>8. Computed per frame — never cached —
+        so a dim first frame cannot corrupt later bright frames."""
+        return 4 if int(arr16.max()) <= 4095 else 8
+
+    @staticmethod
+    def _coherence_score(rgb: Optional[np.ndarray]) -> Optional[float]:
+        """Contrast-normalized high-frequency ratio on a center crop;
+        LOWER = more image-like. Returns None when the crop is too flat
+        to judge (e.g. lens cap on) or the decode failed. Normalizing by
+        the crop's std keeps dim mis-decodes (whose byte-interleave
+        "texture" scales down with the signal) from out-scoring a
+        correct-but-flat decode."""
         if rgb is None or rgb.size == 0:
-            return -1.0
-        r = rgb[..., 0].astype(np.float32)
-        g = rgb[..., 1].astype(np.float32)
-        b = rgb[..., 2].astype(np.float32)
-        std = float(np.std(rgb))
-        if std < 1e-6:
-            return 0.0
-        color_diff = float(np.mean(np.abs(r - g) + np.abs(g - b) + np.abs(b - r)))
-        return std + color_diff * 3.0
+            return None
+        h, w = rgb.shape[:2]
+        ch, cw = min(h, 512), min(w, 512)
+        y0, x0 = (h - ch) // 2, (w - cw) // 2
+        f = rgb[y0:y0 + ch, x0:x0 + cw].astype(np.float32)
+        std = float(f.std())
+        if std < 2.0:
+            return None
+        row_diff = float(np.mean(np.abs(f[1:] - f[:-1])))
+        col_diff = float(np.mean(np.abs(f[:, 1:] - f[:, :-1])))
+        return (row_diff + col_diff) / std
 
-    def _detect_format(self, raw: np.ndarray) -> Dict[str, Any]:
-        """
-        Detect the buffer format ONCE.
-        Returns a cached format dict used by _decode() on every later frame.
-        """
+    @staticmethod
+    def _plausible_yuv422(raw: np.ndarray, fmt: Dict[str, Any]) -> bool:
+        """Sanity-check a YUV422 candidate via its chroma bytes. Real
+        YUV422 chroma sits near 128 (neutral); Bayer/gray 16-bit data
+        misread as YUV422 puts its near-empty high bytes in the chroma
+        slots (mean ~0), which decodes to a smooth but violently
+        color-cast image that can out-score the truth on dim frames."""
+        n = fmt["w"] * fmt["h"] * 2
+        if raw.size < n:
+            return False
+        chroma_offsets = (1, 3) if fmt["kind"] == "yuy2" else (0, 2)
+        luma_offsets = (0, 2) if fmt["kind"] == "yuy2" else (1, 3)
+        for off in chroma_offsets:
+            mean = float(np.mean(raw[off:n:4]))
+            if abs(mean - 128.0) > 64.0:
+                return False
+        # Real video also has non-degenerate luma; 16-bit data misread
+        # as YUV422 leaves the near-empty high bytes in the luma slots
+        luma = np.concatenate([raw[off:n:4][::16] for off in luma_offsets])
+        if float(np.mean(luma)) < 16.0 and float(np.std(luma)) < 2.0:
+            return False
+        return True
+
+    @staticmethod
+    def _parse_pixel_format(spec: str) -> Optional[Dict[str, Any]]:
+        """Parse "bayer16:rggb", "yuy2", "packed12:grbg@1920x960", ..."""
+        try:
+            spec = spec.strip().lower()
+            res = None
+            if "@" in spec:
+                spec, res_s = spec.split("@", 1)
+                w_s, h_s = res_s.split("x")
+                res = (int(w_s), int(h_s))
+            parts = spec.split(":")
+            kind = parts[0]
+            pattern = parts[1] if len(parts) > 1 else "rggb"
+            if pattern not in _LITERAL_BAYER_TO_CV2:
+                logger.warning("Unknown Bayer pattern %r; using rggb", pattern)
+                pattern = "rggb"
+            w, h = res or ((1920, 960) if kind == "packed12" else (3840, 2160))
+            if kind in ("bayer16", "yuy2", "uyvy", "gray16", "gray8",
+                        "bayer8", "packed12"):
+                fmt: Dict[str, Any] = {"kind": kind, "w": w, "h": h}
+                if kind in ("bayer16", "bayer8", "packed12"):
+                    fmt["pattern"] = pattern
+                return fmt
+            logger.warning("Unknown pixel format kind %r", kind)
+            return None
+        except Exception as e:
+            logger.warning("Could not parse pixel format %r: %s", spec, e)
+            return None
+
+    def _candidate_formats(self, n: int) -> list:
+        """Plausible format interpretations for an n-byte buffer, in
+        priority order (ties in scoring resolve to the earliest)."""
+        cands = []
+        patterns = list(_LITERAL_BAYER_TO_CV2)
+
+        def add(kind, w, h, pattern=None):
+            fmt = {"kind": kind, "w": w, "h": h}
+            if pattern:
+                fmt["pattern"] = pattern
+            cands.append(fmt)
+
+        for w, h in [(3840, 2160), (1920, 1080)]:
+            if n == w * h * 2:
+                for p in patterns:  # rggb first (typical for Sony sensors)
+                    add("bayer16", w, h, p)
+                add("yuy2", w, h)
+                add("uyvy", w, h)
+                add("gray16", w, h)
+        for w, h in [(3840, 2160), (4608, 3600), (1920, 1080)]:
+            if n == w * h:
+                for p in patterns:
+                    add("bayer8", w, h, p)
+                add("gray8", w, h)
+        # Legacy interpretation: 12-bit packed at 1920x960 (the first
+        # 2,764,800 bytes). Kept as a low-priority candidate so scoring
+        # can still pick it if it genuinely fits best.
+        if n >= 1920 * 960 * 3 // 2:
+            for p in patterns:
+                add("packed12", 1920, 960, p)
+        return cands
+
+    def _decode_with(self, raw: np.ndarray,
+                     fmt: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Decode raw uint8 buffer -> HxWx3 uint8 RGB per fmt. No searching."""
+        try:
+            kind, w, h = fmt["kind"], fmt["w"], fmt["h"]
+            if kind == "bayer16":
+                arr16 = raw[: w * h * 2].view("<u2").reshape(h, w)
+                bayer8 = (arr16 >> self._u16_shift(arr16)).astype(np.uint8)
+                return cv2.cvtColor(
+                    bayer8, _LITERAL_BAYER_TO_CV2[fmt["pattern"]]
+                )
+            if kind in ("yuy2", "uyvy"):
+                arr = raw[: w * h * 2].reshape(h, w, 2)
+                code = (cv2.COLOR_YUV2RGB_YUY2 if kind == "yuy2"
+                        else cv2.COLOR_YUV2RGB_UYVY)
+                return cv2.cvtColor(arr, code)
+            if kind == "gray16":
+                arr16 = raw[: w * h * 2].view("<u2").reshape(h, w)
+                gray = (arr16 >> self._u16_shift(arr16)).astype(np.uint8)
+                return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            if kind == "bayer8":
+                bayer = raw[: w * h].reshape(h, w)
+                return cv2.cvtColor(
+                    bayer, _LITERAL_BAYER_TO_CV2[fmt["pattern"]]
+                )
+            if kind == "gray8":
+                gray = raw[: w * h].reshape(h, w)
+                return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            if kind == "packed12":
+                img12 = _unpack12(raw[: w * h * 3 // 2], w, h)
+                bayer8 = (img12 >> 4).astype(np.uint8)
+                return cv2.cvtColor(
+                    bayer8, _LITERAL_BAYER_TO_CV2[fmt["pattern"]]
+                )
+            logger.error("Unknown format kind %r", kind)
+            return None
+        except Exception as e:
+            logger.error("Decode failed for %s: %s", fmt, e)
+            return None
+
+    def _resolve_format(self, raw: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Pick the buffer format. Returns None to retry on a later
+        (more contrasty) frame; otherwise returns the format to cache."""
+        if self._forced_format_str:
+            fmt = self._parse_pixel_format(self._forced_format_str)
+            if fmt is not None:
+                logger.info("Using forced pixel format: %s", fmt)
+                return fmt
+
         n = int(raw.size)
-        raw_bytes = raw.tobytes()
+        cands = self._candidate_formats(n)
+        if not cands:
+            logger.warning("No known format for buffer size=%s; "
+                           "falling back to gray8", n)
+            side = int(np.sqrt(n))
+            return {"kind": "gray8", "w": side, "h": n // side}
 
-        # ---- PRIMARY: 1920x1080 12-bit packed Bayer (observed live) ----
-        # The buffer may contain multiple frames. Use only the FIRST one
-        # (the rest is padding/empty).
-        w, h = self.LIVE_RESOLUTION
-        frame_bytes = self.LIVE_BYTES
-        if n >= frame_bytes:
-            # Use the first complete frame in the buffer
-            offset = 0
-            content = np.frombuffer(raw_bytes[offset:offset + frame_bytes], dtype=np.uint8)
-            # Unpack 12-bit packed: 3 bytes -> 2 pixels
-            b = content.reshape(-1, 3)
-            p0 = (b[:, 0].astype(np.uint16) << 4) | (b[:, 1].astype(np.uint16) >> 4)
-            p1 = ((b[:, 1].astype(np.uint16) & 0x0F) << 8) | b[:, 2].astype(np.uint16)
-            pixels = np.empty(b.shape[0] * 2, dtype=np.uint16)
-            pixels[0::2] = p0
-            pixels[1::2] = p1
-            img12 = pixels.reshape(h, w)
-            # Scale 12-bit -> 8-bit
-            scaled = (img12.astype(np.float32) / 4095.0 * 255.0).astype(np.uint8)
-            # Detect Bayer pattern on the full frame.
-            # For dark scenes (where all patterns score similarly), use a
-            # channel-separation heuristic: the correct pattern maximizes
-            # the difference between the brightest and darkest channels.
-            best_code, best_name, best_score = None, None, -1.0
-            for code, name in _BAYER_CODES:
-                try:
-                    rgb = cv2.cvtColor(scaled, code)
-                    s = self._score_rgb(rgb)
-                    # Secondary heuristic: prefer patterns where R and B
-                    # channels differ more (helps with pink/red substrates)
-                    r = rgb[..., 0].astype(np.float32)
-                    g = rgb[..., 1].astype(np.float32)
-                    b = rgb[..., 2].astype(np.float32)
-                    rb_diff = float(np.mean(np.abs(r - b)))
-                    s += rb_diff * 2.0  # bonus for R/B separation
-                    if s > best_score:
-                        best_score, best_code, best_name = s, code, name
-                except Exception:
-                    continue
-            fmt = {
-                "kind": "bayer12",
-                "w": w,
-                "h": h,
-                "code": best_code if best_code is not None else _BAYER_CODES[0][0],
-                "name": best_name if best_name is not None else _BAYER_CODES[0][1],
-            }
-            self.settings["resolution"] = (w, h)
-            logger.info("Detected format: 12-bit packed Bayer %s at %sx%s (score=%.2f)",
-                        fmt["name"], w, h, best_score)
-            return fmt
+        best_fmt, best_ratio = None, None
+        for fmt in cands:
+            if fmt["kind"] in ("yuy2", "uyvy") and not \
+                    self._plausible_yuv422(raw, fmt):
+                continue
+            rgb = self._decode_with(raw, dict(fmt))
+            ratio = self._coherence_score(rgb)
+            if ratio is None:
+                continue
+            if best_ratio is None or ratio < best_ratio:
+                best_fmt, best_ratio = fmt, ratio
 
-        # ---- FALLBACK 1: 16-bit at 3840x2160 ----
-        if n == 3840 * 2160 * 2:
-            w, h = 3840, 2160
-            arr16 = np.frombuffer(raw_bytes, dtype="<u2").reshape(h, w)
-            return {"kind": "gray16", "w": w, "h": h}
+        # Accept only a decode that actually looks like an image. A frame
+        # where every candidate is flat OR noisy (dim, defocused, lens
+        # cap) must NOT commit a format — a mis-decode of a dim frame can
+        # otherwise out-score the correct-but-flat decode and get cached
+        # for the whole session.
+        if best_fmt is None or best_ratio >= self._ACCEPT_RATIO:
+            self._detect_attempts += 1
+            if self._detect_attempts < self._MAX_DETECT_ATTEMPTS:
+                logger.info(
+                    "Frame not judgeable for format detection (best "
+                    "ratio=%s, attempt %s); using default this frame",
+                    "n/a" if best_ratio is None else f"{best_ratio:.2f}",
+                    self._detect_attempts,
+                )
+                return None
+            best_fmt = cands[0]
+            logger.warning("Format detection inconclusive after %s "
+                           "frames; committing to default %s",
+                           self._detect_attempts, best_fmt)
+            return best_fmt
 
-        # ---- FALLBACK 2: 8-bit at 3840x2160 (mono) ----
-        if n == 3840 * 2160:
-            return {"kind": "gray8", "w": 3840, "h": 2160}
-
-        # ---- FALLBACK 3: 8-bit at 1920x1080 ----
-        if n == 1920 * 1080:
-            return {"kind": "gray8", "w": 1920, "h": 1080}
-
-        logger.warning("Could not identify buffer format for size=%s", n)
-        return {"kind": "gray8", "w": 3840, "h": 2160}
+        logger.info("Detected pixel format %s (ratio=%.3f)",
+                    best_fmt, best_ratio)
+        if best_fmt["kind"] in ("bayer16", "bayer8", "packed12"):
+            # The R/B-swapped pattern scores identically by construction —
+            # orientation cannot be determined from image statistics alone.
+            pattern = best_fmt["pattern"]
+            partner = _RB_SWAPPED[pattern]
+            logger.warning(
+                "Bayer R/B orientation is ambiguous (chose %s over %s). "
+                "If red and blue look swapped in the live view, set "
+                "SMARTCAM_PIXEL_FORMAT=%s:%s (or pass pixel_format=) to "
+                "flip it.",
+                pattern, partner, best_fmt["kind"], partner,
+            )
+        return best_fmt
 
     def _decode(self, raw: np.ndarray) -> Optional[np.ndarray]:
         """Decode raw buffer -> HxWx3 uint8 RGB using the cached format."""
+        raw = np.ascontiguousarray(raw)
         if self._fmt is None:
-            self._fmt = self._detect_format(raw)
-        fmt = self._fmt
-        raw_bytes = raw.tobytes()
-
-        if fmt["kind"] == "bayer12":
-            w = fmt["w"]
-            # The buffer contains multiple frames stacked vertically.
-            # Try different frame heights and Bayer patterns to find the
-            # correct combination.
-            best_rgb = None
-            best_score = -1.0
-            best_info = "none"
-            for h in [960, 1080, 540, 480, 360, 270, 240]:
-                frame_bytes = w * h * 3 // 2
-                if raw.size < frame_bytes:
-                    continue
-                # Try this frame height with all Bayer patterns
-                content = np.frombuffer(raw_bytes[:frame_bytes], dtype=np.uint8)
-                b = content.reshape(-1, 3)
-                p0 = (b[:, 0].astype(np.uint16) << 4) | (b[:, 1].astype(np.uint16) >> 4)
-                p1 = ((b[:, 1].astype(np.uint16) & 0x0F) << 8) | b[:, 2].astype(np.uint16)
-                pixels = np.empty(b.shape[0] * 2, dtype=np.uint16)
-                pixels[0::2] = p0
-                pixels[1::2] = p1
-                img12 = pixels.reshape(h, w)
-                # Simple linear stretch 12-bit -> 8-bit
-                scaled = (img12.astype(np.float32) / 4095.0 * 255.0).astype(np.uint8)
-                bayer8 = np.clip(scaled, 0, 255).astype(np.uint8)
-                for code, name in _BAYER_CODES:
-                    try:
-                        rgb = cv2.cvtColor(bayer8, code)
-                        r_mean = float(np.mean(rgb[..., 0]))
-                        g_mean = float(np.mean(rgb[..., 1]))
-                        b_mean = float(np.mean(rgb[..., 2]))
-                        # Natural images have balanced channels
-                        means = np.array([r_mean, g_mean, b_mean])
-                        balance = 1.0 / (1.0 + np.std(means))
-                        color = float(np.std(rgb))
-                        score = balance * 20.0 + color
-                        if score > best_score:
-                            best_score = score
-                            best_rgb = rgb
-                            best_info = f"h={h} pattern={name}"
-                    except Exception:
-                        continue
-            logger.info(f"Selected: {best_info} (score={best_score:.2f})")
-            if best_rgb is None:
-                return np.zeros((960, w, 3), dtype=np.uint8)
-            return best_rgb
-
-        if fmt["kind"] == "bayer8":
-            w, h = fmt["w"], fmt["h"]
-            bayer = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(h, w)
-            # Contrast stretch (percentile) on the full frame
-            lo, hi = np.percentile(bayer, (1.0, 99.5))
-            if hi <= lo:
-                lo, hi = float(bayer.min()), float(bayer.max())
-            if hi <= lo:
-                hi = lo + 1.0
-            scaled = (bayer.astype(np.float32) - lo) * (255.0 / (hi - lo))
-            bayer8 = np.clip(scaled, 0, 255).astype(np.uint8)
-            rgb = cv2.cvtColor(bayer8, fmt["code"])
-            return rgb
-
-        if fmt["kind"] == "gray16":
-            w, h = fmt["w"], fmt["h"]
-            arr16 = np.frombuffer(raw_bytes, dtype="<u2").reshape(h, w)
-            lo, hi = np.percentile(arr16, (1.0, 99.5))
-            if hi <= lo:
-                lo, hi = float(arr16.min()), float(arr16.max())
-            if hi <= lo:
-                hi = lo + 1.0
-            scaled = (arr16.astype(np.float32) - lo) * (255.0 / (hi - lo))
-            gray = np.clip(scaled, 0, 255).astype(np.uint8)
-            return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
-        if fmt["kind"] == "gray8":
-            w, h = fmt["w"], fmt["h"]
-            gray = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(h, w)
-            return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
-        return None
+            if self._skip_detect > 0:
+                self._skip_detect -= 1
+            else:
+                fmt = self._resolve_format(raw)
+                if fmt is not None:
+                    self._fmt = fmt
+                    self.settings["resolution"] = (fmt["w"], fmt["h"])
+                else:
+                    # Scoring all candidates is expensive; while frames
+                    # stay unjudgeable, only retry every few frames.
+                    self._skip_detect = 4
+            if self._fmt is None:
+                cands = self._candidate_formats(int(raw.size))
+                if not cands:
+                    return None
+                return self._decode_with(raw, cands[0])
+        return self._decode_with(raw, self._fmt)
 
     # ------------------------------------------------------------------
     # Connection
@@ -456,6 +580,8 @@ class SmartCamCamera:
             self.connected = True
             self._acquisition_started = False
             self._fmt = None
+            self._detect_attempts = 0
+            self._skip_detect = 0
             logger.info("Connected to camera via SmartCamApi (handle=%s, index=%s)",
                         handle.value, self.camera_index)
 
@@ -573,16 +699,20 @@ class SmartCamCamera:
         index_as_void = ctypes.c_void_p(self.camera_index)
 
         try:
-            # --- Determine buffer size ---
-            buf_size = ctypes.c_int(0)
-            rc = self._dll.ApiCam_GetAcquisitionBufferSize(
-                handle, 1, ctypes.byref(buf_size)
-            )
-            if rc != 0 or buf_size.value <= 0:
-                w, h = self.EXPECTED_RESOLUTION
-                buf_size = ctypes.c_int(w * h)
-            size = int(buf_size.value)
-            self._last_buffer_size = size
+            # --- Determine buffer size (queried once, then cached) ---
+            if self._last_buffer_size > 0:
+                size = self._last_buffer_size
+            else:
+                buf_size = ctypes.c_int(0)
+                rc = self._dll.ApiCam_GetAcquisitionBufferSize(
+                    handle, 1, ctypes.byref(buf_size)
+                )
+                if rc != 0 or buf_size.value <= 0:
+                    # 2 bytes/pixel — an undersized buffer here would let
+                    # the DLL write past the end of it
+                    buf_size = ctypes.c_int(self.LIVE_BYTES)
+                size = int(buf_size.value)
+                self._last_buffer_size = size
 
             # Allocate the reusable 16.5 MB buffer ONCE
             if not hasattr(self, "_acq_buffer") or self._acq_buffer_size != size:
@@ -636,7 +766,9 @@ class SmartCamCamera:
                     pass
                 return None
 
-            raw = np.frombuffer(self._acq_buffer.raw[:size], dtype=np.uint8).copy()
+            raw = np.frombuffer(
+                self._acq_buffer, dtype=np.uint8, count=size
+            ).copy()
             rgb = self._decode(raw)
             if rgb is None:
                 logger.error("Failed to decode raw frame (%s bytes)", raw.size)

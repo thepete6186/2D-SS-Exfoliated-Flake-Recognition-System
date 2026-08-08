@@ -486,6 +486,10 @@ class CameraAnnotator:
         if not folder:
             return
 
+        # Live camera and folder watch would race on current_image
+        if self.camera_connected:
+            self._disconnect_camera()
+
         self.watch_folder = folder
         self.btn_watch_folder.config(text="Stop Watching Folder")
         self.status_bar.config(text=f"Watching: {folder}")
@@ -537,18 +541,29 @@ class CameraAnnotator:
 
     def _start_capture_thread(self):
         """Start the background capture thread."""
-        self._capture_stop.clear()
-        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        # A FRESH Event and a bound camera reference per thread: a zombie
+        # thread from a previous session (e.g. stuck in a hung driver call
+        # past the join timeout) keeps its own already-set event and old
+        # camera object, so it can never resume against the new session.
+        self._capture_stop = threading.Event()
+        self.frame_count = 0
+        self.fps = 0.0
+        self._capture_fps = 0.0
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            args=(self._capture_stop, self.camera),
+            daemon=True,
+        )
         self._capture_thread.start()
         logger.info("Capture thread started")
 
-    def _capture_loop(self):
+    def _capture_loop(self, stop_event, camera):
         """Continuously capture frames in the background."""
         frame_count = 0
         last_time = time.time()
-        while not self._capture_stop.is_set():
+        while not stop_event.is_set():
             try:
-                data = self.camera.capture()
+                data = camera.capture()
                 if data is not None:
                     with self._frame_lock:
                         self._latest_frame = data
@@ -741,11 +756,18 @@ class CameraAnnotator:
         # Convert display coordinates to original image coordinates
         orig_x, orig_y = self._display_to_original(event.x, event.y)
 
-        # Extract HSV at click position
-        hsv = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2HSV)
-        h_val = int(hsv[orig_y, orig_x, 0])
-        s_val = int(hsv[orig_y, orig_x, 1])
-        v_val = int(hsv[orig_y, orig_x, 2])
+        # Ignore clicks on the letterbox/outside the image (negative
+        # indices would silently wrap to the far side of the frame)
+        if not (0 <= orig_x < self.current_image.shape[1]
+                and 0 <= orig_y < self.current_image.shape[0]):
+            return
+
+        # Extract HSV at click position (single pixel, not full frame)
+        pixel = self.current_image[orig_y:orig_y + 1, orig_x:orig_x + 1]
+        hsv = cv2.cvtColor(pixel, cv2.COLOR_RGB2HSV)
+        h_val = int(hsv[0, 0, 0])
+        s_val = int(hsv[0, 0, 1])
+        v_val = int(hsv[0, 0, 2])
         hsv_value = (h_val, s_val, v_val)
 
         # Add point
@@ -776,10 +798,13 @@ class CameraAnnotator:
         orig_x, orig_y = self._display_to_original(event.x, event.y)
 
         if 0 <= orig_x < self.current_image.shape[1] and 0 <= orig_y < self.current_image.shape[0]:
-            hsv = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2HSV)
-            h_val = int(hsv[orig_y, orig_x, 0])
-            s_val = int(hsv[orig_y, orig_x, 1])
-            v_val = int(hsv[orig_y, orig_x, 2])
+            # Single-pixel conversion: a full-frame 4K RGB2HSV on every
+            # <Motion> event stalls the GUI thread and the video refresh
+            pixel = self.current_image[orig_y:orig_y + 1, orig_x:orig_x + 1]
+            hsv = cv2.cvtColor(pixel, cv2.COLOR_RGB2HSV)
+            h_val = int(hsv[0, 0, 0])
+            s_val = int(hsv[0, 0, 1])
+            v_val = int(hsv[0, 0, 2])
 
             # Update status bar with cursor position and HSV
             self.status_bar.config(

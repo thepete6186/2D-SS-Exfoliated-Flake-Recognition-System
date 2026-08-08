@@ -61,6 +61,133 @@ class CameraError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# GenTL component -> RGB conversion
+# ---------------------------------------------------------------------------
+
+# GenICam pixel-format prefix -> OpenCV demosaic code. GenICam names the
+# literal top-left 2x2 (BayerRG = RGGB), while OpenCV names its codes by
+# the second row/column, hence the cross-mapping.
+_GENTL_BAYER_TO_CV2 = {
+    "BayerRG": cv2.COLOR_BayerBG2RGB,  # RGGB
+    "BayerGR": cv2.COLOR_BayerGB2RGB,  # GRBG
+    "BayerGB": cv2.COLOR_BayerGR2RGB,  # GBRG
+    "BayerBG": cv2.COLOR_BayerRG2RGB,  # BGGR
+}
+
+
+def _component_to_rgb(
+    data: np.ndarray, width: int, height: int,
+    data_format: Optional[str] = None,
+) -> np.ndarray:
+    """
+    Convert a harvesters buffer component to an HxWx3 uint8 RGB array,
+    honoring the GenICam pixel format (Bayer CFAs are demosaiced, not
+    treated as grayscale). Returns a copy that does not alias `data`.
+
+    Raises CameraError when the component size fits no known layout —
+    a loud failure beats handing the GUI plausible-looking garbage.
+    """
+    fmt = (data_format or "").strip()
+    low = fmt.lower()
+    npix = width * height
+    arr = np.asarray(data)
+
+    def to_u8(a: np.ndarray) -> np.ndarray:
+        if a.dtype == np.uint8:
+            return a
+        named = 0
+        for b in (16, 12, 10):
+            if str(b) in low:
+                named = b
+                break
+        # Never trust the name alone: left-aligned data in a container
+        # wider than the named depth would wrap when shifted too little
+        needed = max(8, int(a.max()).bit_length())
+        bits = max(named, needed)
+        if bits <= 8:
+            return a.astype(np.uint8)
+        return (a >> (bits - 8)).astype(np.uint8)
+
+    # YUV 4:2:2 family (2 bytes/pixel interleaved) — decode, don't
+    # treat the byte stream as pixels. GenICam YUV422_8 is UYVY-ordered;
+    # YCbCr422_8 is YUYV-ordered.
+    if arr.ndim == 1 and ("yuv422" in low or "ycbcr422" in low):
+        if arr.dtype != np.uint8 or arr.size < npix * 2:
+            raise CameraError(
+                f"Unexpected YUV422 component: dtype={arr.dtype} "
+                f"size={arr.size} for {width}x{height}"
+            )
+        packed = arr[: npix * 2].reshape(height, width, 2)
+        code = (cv2.COLOR_YUV2RGB_YUY2 if "ycbcr422" in low
+                else cv2.COLOR_YUV2RGB_UYVY)
+        if "uyvy" in low:
+            code = cv2.COLOR_YUV2RGB_UYVY
+        return cv2.cvtColor(packed, code)
+
+    # 12-bit packed (1.5 bytes/pixel) delivered as raw bytes
+    if arr.ndim == 1 and arr.dtype == np.uint8 and (
+        "12p" in low or "12packed" in low
+    ):
+        if arr.size < npix * 3 // 2:
+            raise CameraError(
+                f"Packed-12 component too small: {arr.size} bytes for "
+                f"{width}x{height}"
+            )
+        from camera.smartcam_camera import _unpack12
+        arr = _unpack12(arr[: npix * 3 // 2], width, height)
+    # Multi-byte pixels delivered as raw bytes (2 bytes/pixel)
+    elif (arr.ndim == 1 and arr.dtype == np.uint8
+          and arr.size == npix * 2
+          and any(str(b) in low for b in (10, 12, 16))):
+        arr = arr.view("<u2").reshape(height, width)
+    # Shape the flat buffer; only exact layouts are accepted
+    elif arr.ndim == 1:
+        if arr.size == npix:
+            arr = arr.reshape(height, width)
+        elif arr.size == npix * 3:
+            arr = arr.reshape(height, width, 3)
+        elif arr.size == npix * 4:
+            arr = arr.reshape(height, width, 4)
+        else:
+            raise CameraError(
+                f"Unexpected component size: {arr.size} values for "
+                f"{width}x{height} ({fmt or 'unknown format'})"
+            )
+
+    # Bayer CFA -> demosaic
+    for prefix, code in _GENTL_BAYER_TO_CV2.items():
+        if fmt.startswith(prefix):
+            cfa = arr if arr.ndim == 2 else arr[..., 0]
+            return cv2.cvtColor(to_u8(cfa), code)
+
+    if arr.ndim == 2:
+        # No pixel format info: an unlabeled single channel on a color
+        # camera is almost certainly a Bayer CFA; demosaicing with any
+        # pattern beats displaying the raw checkerboard. Mono formats
+        # stay grayscale.
+        if not fmt or fmt.startswith("Bayer"):
+            return cv2.cvtColor(
+                to_u8(arr), _GENTL_BAYER_TO_CV2["BayerRG"]
+            )
+        return cv2.cvtColor(to_u8(arr), cv2.COLOR_GRAY2RGB)
+
+    if arr.shape[2] == 3:
+        arr = to_u8(arr)
+        if fmt.startswith("BGR"):
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        # GenICam "RGB8" is genuinely RGB-ordered — do not swap.
+        return arr.copy()
+
+    if arr.shape[2] == 4:
+        arr = to_u8(arr)
+        if fmt.startswith("BGRA"):
+            return cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+        return cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+
+    return np.ascontiguousarray(arr[..., :3]).copy()
+
+
+# ---------------------------------------------------------------------------
 # USB device detection (pyusb) – informational only
 # ---------------------------------------------------------------------------
 
@@ -238,7 +365,7 @@ class ZeissCamera:
             "exposure_us": 10000.0,  # 10 ms default
             "gain_db": 0.0,
             "white_balance": "auto",
-            "resolution": (5472, 3648),  # Max resolution, adjustable
+            "resolution": (3840, 2160),  # Axiocam 208 4K live resolution
             "pixel_format": "RGB",
         }
 
@@ -269,6 +396,7 @@ class ZeissCamera:
 
     def _connect_gentl(self) -> bool:
         """Connect via GenICam GenTL using the harvesters library."""
+        h = None
         try:
             cti_files = (
                 [self._gentl_file]
@@ -351,6 +479,11 @@ class ZeissCamera:
 
         except Exception as e:
             logger.error(f"GenTL connection failed: {e}")
+            if h is not None:
+                try:
+                    h.reset()
+                except Exception:
+                    pass
             self._ia = None
             self._harvester = None
             return False
@@ -473,34 +606,13 @@ class ZeissCamera:
 
             with self._ia.fetch_buffer(timeout=5.0) as buffer:
                 component = buffer.payload.components[0]
-                # component.data is a 1-D numpy array; reshape to 2D/3D
-                data = component.data
-                w = component.width
-                h = component.height
-
-                # Number of channels
-                if data.ndim == 1:
-                    nb = data.size // (w * h)
-                    data = (
-                        data.reshape(h, w, nb)
-                        if nb > 1
-                        else data.reshape(h, w)
-                    )
-
-                # Convert to RGB
-                if data.ndim == 2:
-                    # Grayscale -> RGB
-                    rgb = cv2.cvtColor(data, cv2.COLOR_GRAY2RGB)
-                elif data.shape[2] == 1:
-                    rgb = cv2.cvtColor(data, cv2.COLOR_GRAY2RGB)
-                elif data.shape[2] == 3:
-                    # Assume BGR (common) -> RGB
-                    rgb = cv2.cvtColor(data, cv2.COLOR_BGR2RGB)
-                elif data.shape[2] == 4:
-                    rgb = cv2.cvtColor(data, cv2.COLOR_BGRA2RGB)
-                else:
-                    rgb = data[..., :3]
-
+                data_format = getattr(component, "data_format", None)
+                rgb = _component_to_rgb(
+                    component.data,
+                    int(component.width),
+                    int(component.height),
+                    data_format,
+                )
                 self._last_frame_time = time.time()
                 return np.ascontiguousarray(rgb)
 

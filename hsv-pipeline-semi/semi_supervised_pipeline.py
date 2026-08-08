@@ -224,11 +224,14 @@ class SemiSupervisedPipeline:
         s_all = np.concatenate(s_vals) if s_vals else np.array([0.0])
         v_all = np.concatenate(v_vals) if v_vals else np.array([0.0])
 
-        mean_H = float(np.mean(h_all))
+        # Hue is circular (OpenCV 0..179 wraps: 0 and 179 are both red) —
+        # linear mean/std of a red flake straddling the wrap would give a
+        # spurious cyan mean (~90) with a huge std (~87)
+        mean_H, std_H = self._circular_mean_std(h_all)
         mean_S = float(np.mean(s_all))
         mean_V = float(np.mean(v_all))
 
-        std_H = float(np.std(h_all)) + self.epsilon
+        std_H = std_H + self.epsilon
         std_S = float(np.std(s_all)) + self.epsilon
         std_V = float(np.std(v_all)) + self.epsilon
 
@@ -261,6 +264,23 @@ class SemiSupervisedPipeline:
     def _circular_delta(h1: float, h2: float) -> float:
         """Signed circular difference h1 - h2 in [-90, +90]."""
         return float(((h1 - h2 + 90.0) % 180.0) - 90.0)
+
+    @staticmethod
+    def _circular_mean_std(h_vals: np.ndarray) -> Tuple[float, float]:
+        """Circular mean and std of OpenCV hue values (0..179).
+
+        Hue is mapped onto the full circle (x2), averaged as unit
+        vectors, and mapped back; std comes from the resultant length
+        (sqrt(-2 ln R)), which matches the linear std for tight
+        clusters away from the wrap.
+        """
+        ang = np.asarray(h_vals, dtype=np.float64) * (np.pi / 90.0)
+        c = float(np.mean(np.cos(ang)))
+        s = float(np.mean(np.sin(ang)))
+        mean = (np.degrees(np.arctan2(s, c)) / 2.0) % 180.0
+        r = min(1.0, float(np.hypot(c, s)))
+        std = np.degrees(np.sqrt(max(0.0, -2.0 * np.log(max(r, 1e-12))))) / 2.0
+        return float(mean), float(std)
 
     # ------------------------------------------------------------------
     # Step 6: Probability computation via Gaussian likelihood matching

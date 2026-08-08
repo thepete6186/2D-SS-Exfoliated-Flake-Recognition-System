@@ -136,7 +136,7 @@ In the GUI:
 | `exposure_us` | float | 10000.0 | Exposure time in microseconds |
 | `gain_db` | float | 0.0 | Gain in decibels |
 | `white_balance` | str | 'auto' | White balance mode |
-| `resolution` | tuple | (5472, 3648) | Image resolution (width, height) |
+| `resolution` | tuple | (3840, 2160) | Image resolution (width, height) |
 
 ## API Reference
 
@@ -336,7 +336,7 @@ cam.disconnect()
 
 ## Notes
 
-- The Axiocam 208 is a **scientific camera** with high resolution (up to 5472×3648)
+- The Axiocam 208 is a **scientific camera** with 4K live resolution (3840×2160, 8.3 MP; its live buffer is 3840×2160 at 2 bytes/pixel)
 - Micro-Manager (pymmcore) is the **recommended** backend since it provides proper
   support for scientific cameras via the open-source Micro-Manager SDK
 - For consistent HSV detection, use **fixed exposure and gain** (don't use auto-exposure)
