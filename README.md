@@ -32,17 +32,17 @@ An automated hardware-software framework designed to scan optical microscopy sam
 
 - **Optical Detector / Camera:** Carl Zeiss Axiocam 208 Color
 - **Motorized Stage:** Precise XY5050 Stage
-- **Stage Controller:** OLIX ZC300 Motion Controller
+- **Stage Controller:** Zolix ZC300 Motion Controller
 
 ---
 
 ## 🚀 Near-Term Development Roadmap
 
 ### Current Focus (Immediate Step):
-- [ ] **Interactive Calibration Engine:** Implement live camera stream view with click-to-calibrate functionality for bare substrate selection.
+- [x] **Interactive Calibration Engine:** Live camera stream view with click-to-calibrate for bare substrate selection (annotator toggle/Shift-click → points JSON → `--substrate-json` CLI flag → pipeline override).
 - [ ] **Hardware Driver Integration:** Build Python wrappers for:
   - Zeiss Axiocam 208 capture pipeline.
-  - OLIX ZC300 stage controller over serial/USB communications (step movement, home, position querying).
+  - Zolix ZC300 stage controller over serial/USB communications (step movement, home, position querying).
 - [ ] **Automated Raster-Scan Loop:** Implement coordinated frame acquisition and stage stepping for systematic grid coverage.
 
 ### Future Roadmap (Post-Scanning):
@@ -111,8 +111,41 @@ See `hsv-pipeline-semi/README.md` for full documentation.
 - Python 3.7+
 - numpy, opencv-python, matplotlib, scipy
 - Zeiss Axiocam 208 SDK (pending integration)
-- OLIX ZC300 serial communication library (pending integration)
+- Zolix ZC300 stage control (pyserial, Modbus RTU — see `stage/`)
 - Motorized microscope stage with XY5050 controller
+
+---
+
+## 🎛️ Stage Control (`stage/`)
+
+Driver package for the Zolix ZC300 motion controller (Modbus RTU over a
+USB virtual COM port, fixed 115200 8N1). Works in integer pulses;
+physical-unit conversion stays in `camera/coordinate_mapper.py`.
+
+```python
+from stage import ZolixZC300, SimulatedStage
+
+stage = ZolixZC300(port="COM3")        # SimulatedStage() for dry runs
+stage.connect()
+stage.move_relative("x", 1000)          # blocks until the axis stops
+stage.home("all")
+print(stage.get_position())             # {'x': ..., 'y': ..., 'r': ...}
+stage.disconnect()
+```
+
+Smoke test on the lab PC (validates the absolute-move and home opcodes,
+which are implemented from the register map but not yet exercised on
+hardware):
+
+```
+python -m stage.zc300_smoke --list-ports
+python -m stage.zc300_smoke --port COM3 --identify --status
+python -m stage.zc300_smoke --port COM3 --jog x 1000
+```
+
+Adapted from [transfer-stage-control](https://github.com/Lewbert/transfer-stage-control)
+(MIT), with absolute moves, homing, and blocking waits added for
+raster scanning.
 
 ---
 
@@ -121,10 +154,10 @@ See `hsv-pipeline-semi/README.md` for full documentation.
 | Module | Status | Notes |
 |--------|--------|-------|
 | HSV Detection Algorithm | ✅ Complete | Semi-supervised pipeline operational |
-| Substrate Calibration | ✅ Complete | Global histogram mode + noise floor estimation |
+| Substrate Calibration | ✅ Complete | Click-to-calibrate (annotator) + global histogram fallback |
 | Flake Signature Learning | ✅ Complete | Click-based extraction with direction-aware matching |
 | Camera Driver | ⏳ Pending | Zeiss Axiocam 208 integration required |
-| Stage Controller | ⏳ Pending | OLIX ZC300 serial/USB driver required |
+| Stage Controller | 🧪 Implemented | Zolix ZC300 Modbus RTU driver (`stage/`) — pending hardware validation |
 | Raster-Scan Loop | ⏳ Pending | Coordinated acquisition + stage stepping |
 | Target Queueing | ⏳ Pending | Contour detection + area filtering + re-centering |
 | Wafer Stitching | 🔮 Future | Full-sample mosaic generation |

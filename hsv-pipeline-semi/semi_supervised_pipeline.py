@@ -65,6 +65,8 @@ class SemiSupervisedPipeline:
         self,
         rgb_image: np.ndarray,
         seed_points: List[Tuple[int, int]],
+        substrate_peak: Optional[Tuple[float, float, float]] = None,
+        substrate_std: Optional[Tuple[float, float, float]] = None,
     ) -> Dict[str, object]:
         """
         Run the full semi-supervised pipeline.
@@ -75,6 +77,14 @@ class SemiSupervisedPipeline:
             RGB uint8 image of shape (H, W, 3).
         seed_points : list of (x, y) tuples
             Pixel coordinates where the user clicked on flake regions.
+        substrate_peak : (H, S, V) tuple, optional
+            Operator-supplied substrate reference (e.g. from click-to-calibrate
+            in the annotator). When given, the automatic whole-frame histogram
+            detection is skipped and deviations are measured from this peak.
+        substrate_std : (sigma_H, sigma_S, sigma_V) tuple, optional
+            Operator-supplied substrate noise floor. When omitted while
+            substrate_peak is given, the noise floor is auto-estimated from
+            this image around the supplied peak.
 
         Returns
         -------
@@ -85,6 +95,7 @@ class SemiSupervisedPipeline:
             - 'delta_V'           : signed value deviation from substrate
             - 'substrate_peak'    : (H_sub, S_sub, V_sub)
             - 'substrate_std'     : (sigma_H, sigma_S, sigma_V)
+            - 'substrate_source'  : 'auto' or 'override'
             - 'flake_signature'   : dict with mean, std, and reference deviations
             - 'heatmap_rgb'       : uint8 (H, W, 3) Inferno heatmap
             - 'seed_patches'      : list of patch bounding boxes for visualization
@@ -93,12 +104,19 @@ class SemiSupervisedPipeline:
         hsv = self._convert_to_hsv(rgb_image)
         H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
-        # Step 2: Automatic substrate detection
-        substrate_peak = self._find_substrate_peak(hsv)
+        # Step 2: Substrate reference — operator-supplied or automatic
+        substrate_source = "auto" if substrate_peak is None else "override"
+        if substrate_peak is None:
+            substrate_peak = self._find_substrate_peak(hsv)
+        else:
+            substrate_peak = tuple(float(c) for c in substrate_peak)
         H_sub, S_sub, V_sub = substrate_peak
 
         # Step 3: Substrate noise floor
-        substrate_std = self._estimate_substrate_std(hsv, substrate_peak)
+        if substrate_std is None:
+            substrate_std = self._estimate_substrate_std(hsv, substrate_peak)
+        else:
+            substrate_std = tuple(float(c) for c in substrate_std)
         sigma_H, sigma_S, sigma_V = substrate_std
 
         # Step 4: Extract flake signature from seed clicks
@@ -129,6 +147,7 @@ class SemiSupervisedPipeline:
             "delta_V": delta_V,
             "substrate_peak": substrate_peak,
             "substrate_std": substrate_std,
+            "substrate_source": substrate_source,
             "flake_signature": flake_sig,
             "heatmap_rgb": heatmap,
             "seed_patches": seed_patches,
@@ -336,6 +355,8 @@ class SemiSupervisedPipeline:
         self,
         rgb_image: np.ndarray,
         flake_sig: Dict,
+        substrate_peak: Optional[Tuple[float, float, float]] = None,
+        substrate_std: Optional[Tuple[float, float, float]] = None,
     ) -> Dict[str, object]:
         """
         Apply a pre-existing flake signature to a new image.
@@ -343,7 +364,8 @@ class SemiSupervisedPipeline:
         This is used in calibrate mode: the flake signature (deviation
         vector + per-channel std) is extracted from one calibration image,
         then applied to all other images in the same sample. Each image
-        still gets its own automatic substrate detection.
+        gets its own automatic substrate detection unless an operator
+        substrate_peak / substrate_std override is supplied (see process()).
 
         Parameters
         ----------
@@ -353,6 +375,8 @@ class SemiSupervisedPipeline:
             Flake signature dict (from a previous process() call's
             'flake_signature' field). Must contain:
             delta_H_ref, delta_S_ref, delta_V_ref, std_H, std_S, std_V.
+        substrate_peak, substrate_std : tuples, optional
+            Operator substrate override, same semantics as process().
 
         Returns
         -------
@@ -362,12 +386,19 @@ class SemiSupervisedPipeline:
         hsv = self._convert_to_hsv(rgb_image)
         H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
-        # Step 2: Automatic substrate detection (per-image)
-        substrate_peak = self._find_substrate_peak(hsv)
+        # Step 2: Substrate reference — operator-supplied or per-image automatic
+        substrate_source = "auto" if substrate_peak is None else "override"
+        if substrate_peak is None:
+            substrate_peak = self._find_substrate_peak(hsv)
+        else:
+            substrate_peak = tuple(float(c) for c in substrate_peak)
         H_sub, S_sub, V_sub = substrate_peak
 
         # Step 3: Substrate noise floor
-        substrate_std = self._estimate_substrate_std(hsv, substrate_peak)
+        if substrate_std is None:
+            substrate_std = self._estimate_substrate_std(hsv, substrate_peak)
+        else:
+            substrate_std = tuple(float(c) for c in substrate_std)
 
         # Step 4: Compute signed deviation maps (relative to THIS image's substrate)
         delta_H = self._signed_hue_deviation(H, H_sub)
@@ -387,6 +418,7 @@ class SemiSupervisedPipeline:
             "delta_V": delta_V,
             "substrate_peak": substrate_peak,
             "substrate_std": substrate_std,
+            "substrate_source": substrate_source,
             "flake_signature": flake_sig,
             "heatmap_rgb": heatmap,
         }
@@ -408,3 +440,138 @@ class SemiSupervisedPipeline:
             y1 = min(shape[0], y + r + 1)
             boxes.append((x0, y0, x1, y1))
         return boxes
+
+
+# ----------------------------------------------------------------------
+# Click-to-calibrate substrate sampling (module-level helpers)
+#
+# Used by the camera annotator to turn operator clicks on bare substrate
+# into a (peak, std) reference that process() / process_with_signature()
+# accept as substrate_peak / substrate_std overrides. Kept here so the
+# circular-hue statistics live next to the pipeline that consumes them.
+# ----------------------------------------------------------------------
+
+def _rgb_to_hsv_f32(rgb_image: np.ndarray) -> np.ndarray:
+    """Convert an RGB image to float32 OpenCV HSV (H 0-179, S/V 0-255)."""
+    if rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
+        raise ValueError(f"Expected (H, W, 3) image, got {rgb_image.shape}")
+    if rgb_image.dtype != np.uint8:
+        rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV).astype(np.float32)
+
+
+def _clipped_patch_pixels(
+    hsv: np.ndarray, x: int, y: int, radius: int
+) -> np.ndarray:
+    """Flattened (N, 3) pixels of a border-clipped square patch."""
+    h, w = hsv.shape[:2]
+    x, y = int(x), int(y)
+    x0, x1 = max(0, x - radius), min(w, x + radius + 1)
+    y0, y1 = max(0, y - radius), min(h, y + radius + 1)
+    return hsv[y0:y1, x0:x1].reshape(-1, 3)
+
+
+def extract_hsv_patch(
+    rgb_image: np.ndarray, x: int, y: int, radius: int = 7
+) -> np.ndarray:
+    """
+    Extract HSV pixels from a square patch around (x, y).
+
+    Parameters
+    ----------
+    rgb_image : np.ndarray
+        RGB image of shape (H, W, 3).
+    x, y : int
+        Patch center in image coordinates.
+    radius : int
+        Half-size of the patch (patch size = 2*radius + 1, clipped at
+        image borders).
+
+    Returns
+    -------
+    np.ndarray
+        Float32 array of shape (N, 3) with OpenCV HSV pixels.
+    """
+    return _clipped_patch_pixels(_rgb_to_hsv_f32(rgb_image), x, y, radius)
+
+
+def substrate_stats_from_pixels(
+    hsv_pixels: np.ndarray, epsilon: float = 1e-5
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Substrate (peak, std) from sampled HSV pixels.
+
+    Hue uses circular statistics (OpenCV hue wraps at 180: 0 and 179 are
+    both red); saturation and value use linear mean/std.
+
+    Parameters
+    ----------
+    hsv_pixels : np.ndarray
+        Array of shape (N, 3) with OpenCV HSV pixels.
+    epsilon : float
+        Added to each std component to prevent zero noise floors.
+
+    Returns
+    -------
+    ((H, S, V), (sigma_H, sigma_S, sigma_V))
+    """
+    px = np.asarray(hsv_pixels, dtype=np.float32).reshape(-1, 3)
+    if px.shape[0] == 0:
+        raise ValueError("No pixels supplied for substrate statistics")
+
+    mean_H, std_H = SemiSupervisedPipeline._circular_mean_std(px[:, 0])
+    peak = (
+        float(mean_H),
+        float(np.mean(px[:, 1])),
+        float(np.mean(px[:, 2])),
+    )
+    std = (
+        float(std_H) + epsilon,
+        float(np.std(px[:, 1])) + epsilon,
+        float(np.std(px[:, 2])) + epsilon,
+    )
+    return peak, std
+
+
+def substrate_from_samples(
+    rgb_image: np.ndarray,
+    points: List[Tuple[int, int]],
+    patch_radius: int = 7,
+    epsilon: float = 1e-5,
+) -> Dict[str, object]:
+    """
+    Build a substrate calibration from operator clicks on bare substrate.
+
+    Parameters
+    ----------
+    rgb_image : np.ndarray
+        RGB image of shape (H, W, 3).
+    points : list of (x, y) tuples
+        Click positions on bare substrate.
+    patch_radius : int
+        Half-size of the patch sampled around each click.
+    epsilon : float
+        Std floor, see substrate_stats_from_pixels.
+
+    Returns
+    -------
+    dict
+        {'peak': [H, S, V], 'std': [sH, sS, sV],
+         'n_pixels': int, 'n_samples': int}
+    """
+    hsv = _rgb_to_hsv_f32(rgb_image)
+    arrays = [
+        _clipped_patch_pixels(hsv, x, y, patch_radius) for (x, y) in points
+    ]
+    arrays = [a for a in arrays if a.shape[0] > 0]
+    if not arrays:
+        raise ValueError("No in-bounds substrate samples")
+
+    all_px = np.concatenate(arrays, axis=0)
+    peak, std = substrate_stats_from_pixels(all_px, epsilon=epsilon)
+    return {
+        "peak": [float(c) for c in peak],
+        "std": [float(c) for c in std],
+        "n_pixels": int(all_px.shape[0]),
+        "n_samples": len(arrays),
+    }

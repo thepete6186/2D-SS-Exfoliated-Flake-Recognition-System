@@ -26,6 +26,7 @@ Workflow:
 import argparse
 import json
 from pathlib import Path
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,6 +34,80 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 from semi_supervised_pipeline import SemiSupervisedPipeline
+
+
+# ===========================================================================
+# Operator substrate override (click-to-calibrate bridge)
+# ===========================================================================
+
+def parse_hsv_triplet(s: str) -> Tuple[float, float, float]:
+    """Parse 'H,S,V' into a float triplet; raises ValueError when malformed."""
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"Expected 'H,S,V', got: {s!r}")
+    try:
+        h, sv, v = (float(p) for p in parts)
+    except ValueError:
+        raise ValueError(f"Non-numeric 'H,S,V' triplet: {s!r}")
+    return (h, sv, v)
+
+
+def load_substrate_from_json(
+    path,
+) -> Tuple[Optional[Tuple[float, float, float]], Optional[Tuple[float, float, float]]]:
+    """
+    Read a substrate reference from an annotator points JSON.
+
+    Prefers the 'substrate_calibration' block (peak + std from
+    click-to-calibrate); falls back to the legacy 'substrate_hsv' key
+    (peak only). Returns (None, None) when neither is present.
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    cal = data.get("substrate_calibration")
+    if cal and cal.get("peak"):
+        peak = tuple(float(c) for c in cal["peak"])
+        std = tuple(float(c) for c in cal["std"]) if cal.get("std") else None
+        return peak, std
+
+    legacy = data.get("substrate_hsv")
+    if legacy:
+        return tuple(float(c) for c in legacy), None
+
+    return None, None
+
+
+def resolve_substrate_override(
+    args,
+) -> Tuple[Optional[Tuple[float, float, float]], Optional[Tuple[float, float, float]]]:
+    """
+    Resolve --substrate-hsv / --substrate-json / --substrate-std into a
+    (peak, std) override pair.
+
+    Precedence: --substrate-hsv beats --substrate-json. A json std is
+    dropped when the peak comes from --substrate-hsv (it was measured
+    around the json peak); only an explicit --substrate-std attaches to
+    an explicit peak. The override peak is global — applied identically
+    to every frame — while a missing std is auto-derived per frame.
+    """
+    peak, std = None, None
+
+    if getattr(args, "substrate_json", None):
+        peak, std = load_substrate_from_json(args.substrate_json)
+
+    if getattr(args, "substrate_hsv", None):
+        peak = parse_hsv_triplet(args.substrate_hsv)
+        std = None
+
+    if getattr(args, "substrate_std", None):
+        if peak is None:
+            raise ValueError(
+                "--substrate-std requires --substrate-hsv or --substrate-json"
+            )
+        std = parse_hsv_triplet(args.substrate_std)
+
+    return peak, std
 
 
 # ===========================================================================
@@ -286,6 +361,23 @@ def main():
         help="Pre-defined clicks as 'x1,y1 x2,y2 ...' (non-interactive mode).",
     )
     parser.add_argument(
+        "--substrate-json", type=str, default=None,
+        help="Annotator points JSON with a click-to-calibrate substrate "
+             "reference (prefers 'substrate_calibration', falls back to "
+             "legacy 'substrate_hsv'). The peak applies globally to every "
+             "frame; a missing std is auto-derived per frame.",
+    )
+    parser.add_argument(
+        "--substrate-hsv", type=str, default=None,
+        help="Substrate peak override as 'H,S,V' (OpenCV ranges). "
+             "Wins over --substrate-json.",
+    )
+    parser.add_argument(
+        "--substrate-std", type=str, default=None,
+        help="Substrate noise floor override as 'sH,sS,sV'. Only valid "
+             "together with --substrate-hsv or --substrate-json.",
+    )
+    parser.add_argument(
         "--output-dir", type=str,
         default=str(Path(__file__).resolve().parent / "results"),
         help="Output directory for results.",
@@ -307,6 +399,14 @@ def main():
         help="Value channel weight (default: 1.0).",
     )
     args = parser.parse_args()
+
+    try:
+        sub_peak, sub_std = resolve_substrate_override(args)
+    except (ValueError, OSError) as e:
+        parser.error(str(e))
+    if sub_peak is not None:
+        print(f"Substrate override: peak={sub_peak}"
+              + (f", std={sub_std}" if sub_std else " (std auto per frame)"))
 
     pipeline = SemiSupervisedPipeline(
         patch_radius=args.patch_radius,
@@ -334,7 +434,9 @@ def main():
 
         print(f"\nProcessing: {image_path.name}")
         print(f"  Clicks: {clicks}")
-        result = pipeline.process(rgb, clicks)
+        result = pipeline.process(rgb, clicks,
+                                  substrate_peak=sub_peak,
+                                  substrate_std=sub_std)
 
         sub = result["substrate_peak"]
         sig = result["flake_signature"]
@@ -366,6 +468,7 @@ def main():
             "clicks": clicks,
             "substrate_peak": list(sub),
             "substrate_std": list(result["substrate_std"]),
+            "substrate_source": result["substrate_source"],
             "flake_signature": {k: v for k, v in sig.items()},
             "probability_range": [float(prob.min()), float(prob.max())],
         }
@@ -422,7 +525,9 @@ def main():
 
         # Step 2: Run full pipeline on calibration image to get flake signature
         print(f"\n  Clicks: {clicks}")
-        cal_result = pipeline.process(cal_rgb, clicks)
+        cal_result = pipeline.process(cal_rgb, clicks,
+                                      substrate_peak=sub_peak,
+                                      substrate_std=sub_std)
         flake_sig = cal_result["flake_signature"]
 
         cal_sub = cal_result["substrate_peak"]
@@ -451,6 +556,7 @@ def main():
             "clicks": clicks,
             "substrate_peak": list(cal_sub),
             "substrate_std": list(cal_result["substrate_std"]),
+            "substrate_source": cal_result["substrate_source"],
             "flake_signature": {k: v for k, v in flake_sig.items()},
             "probability_range": [float(cal_result["probability_map"].min()),
                                   float(cal_result["probability_map"].max())],
@@ -474,7 +580,9 @@ def main():
                 print(f"      (calibration image — already saved)")
                 continue
 
-            result = pipeline.process_with_signature(rgb, flake_sig)
+            result = pipeline.process_with_signature(rgb, flake_sig,
+                                                     substrate_peak=sub_peak,
+                                                     substrate_std=sub_std)
 
             sub = result["substrate_peak"]
             prob = result["probability_map"]
@@ -500,6 +608,7 @@ def main():
                 "calibration_clicks": clicks,
                 "substrate_peak": list(sub),
                 "substrate_std": list(result["substrate_std"]),
+                "substrate_source": result["substrate_source"],
                 "flake_signature": {k: v for k, v in flake_sig.items()},
                 "probability_range": [float(prob.min()), float(prob.max())],
             }
@@ -543,7 +652,9 @@ def main():
             print(f"\n  {img_path.name}")
             print(f"    Clicks: {clicks}")
             rgb = load_rgb_image(img_path)
-            result = pipeline.process(rgb, clicks)
+            result = pipeline.process(rgb, clicks,
+                                      substrate_peak=sub_peak,
+                                      substrate_std=sub_std)
 
             sub = result["substrate_peak"]
             sig = result["flake_signature"]
@@ -570,6 +681,7 @@ def main():
                 "clicks": clicks,
                 "substrate_peak": list(sub),
                 "substrate_std": list(result["substrate_std"]),
+                "substrate_source": result["substrate_source"],
                 "flake_signature": {k: v for k, v in sig.items()},
                 "probability_range": [float(prob.min()), float(prob.max())],
             }

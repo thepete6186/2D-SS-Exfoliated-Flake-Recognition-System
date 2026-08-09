@@ -21,7 +21,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -35,6 +35,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from camera.zeiss_camera import ZeissCamera, CameraError
 from camera.mmcore_camera import MMCoreCamera
 from camera.smartcam_camera import SmartCamCamera
+
+# 'hsv-pipeline-semi' is hyphenated -> not a package; import by path
+# (same pattern as tests/test_hsv_signature.py)
+sys.path.insert(0, str(Path(__file__).parent.parent / "hsv-pipeline-semi"))
+from semi_supervised_pipeline import extract_hsv_patch, substrate_stats_from_pixels
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,6 +67,93 @@ class Point:
     def from_dict(cls, data):
         hsv = tuple(data["hsv"]) if data.get("hsv") else None
         return cls(data["x"], data["y"], hsv, data.get("label", ""))
+
+
+# ----------------------------------------------------------------------
+# Click-to-calibrate substrate helpers (tkinter-free, unit-testable)
+# ----------------------------------------------------------------------
+
+SUBSTRATE_PATCH_RADIUS = 7
+MIN_CALIB_PIXELS = 50
+
+
+def compute_calibration_from_samples(
+    pixel_arrays: List[np.ndarray],
+    min_pixels: int = MIN_CALIB_PIXELS,
+) -> Optional[dict]:
+    """
+    Aggregate cached per-click HSV patch pixels into a substrate calibration.
+
+    Parameters
+    ----------
+    pixel_arrays : list of np.ndarray
+        One (N, 3) float32 HSV array per substrate click.
+    min_pixels : int
+        Below this total pixel count the std is reported as None (too few
+        samples for a trustworthy noise floor; the pipeline auto-derives
+        it at process time instead).
+
+    Returns
+    -------
+    dict or None
+        {'peak': [H, S, V], 'std': [sH, sS, sV] | None,
+         'n_pixels': int, 'n_samples': int}, or None with no samples.
+    """
+    arrays = [np.asarray(a, dtype=np.float32).reshape(-1, 3) for a in pixel_arrays]
+    arrays = [a for a in arrays if a.shape[0] > 0]
+    if not arrays:
+        return None
+
+    all_px = np.concatenate(arrays, axis=0)
+    peak, std = substrate_stats_from_pixels(all_px)
+    return {
+        "peak": [float(c) for c in peak],
+        "std": [float(c) for c in std] if all_px.shape[0] >= min_pixels else None,
+        "n_pixels": int(all_px.shape[0]),
+        "n_samples": len(arrays),
+    }
+
+
+def build_points_payload(
+    points: List["Point"],
+    substrate_calibration: Optional[dict],
+    image_size: Optional[Tuple[int, int]],
+    fallback_substrate_hsv: Optional[Tuple[int, int, int]] = None,
+) -> dict:
+    """
+    Build the points-JSON payload.
+
+    The legacy 'substrate_hsv' key keeps carrying the peak (as ints) so
+    pre-calibration readers stay compatible; the full calibration lives
+    in 'substrate_calibration'.
+    """
+    if substrate_calibration:
+        legacy = [int(round(c)) for c in substrate_calibration["peak"]]
+    elif fallback_substrate_hsv:
+        legacy = [int(round(c)) for c in fallback_substrate_hsv]
+    else:
+        legacy = None
+
+    return {
+        "points": [p.to_dict() for p in points],
+        "substrate_hsv": legacy,
+        "substrate_calibration": substrate_calibration,
+        "image_size": image_size,
+    }
+
+
+def parse_points_payload(data: dict) -> Tuple[List["Point"], Optional[dict]]:
+    """
+    Parse a points-JSON payload (tolerates legacy files).
+
+    Returns
+    -------
+    (points, substrate_calibration)
+        substrate_calibration is None for pre-calibration files; the
+        legacy 'substrate_hsv' key stays available on the raw dict.
+    """
+    points = [Point.from_dict(p) for p in data.get("points", [])]
+    return points, data.get("substrate_calibration")
 
 
 class CameraAnnotator:
@@ -101,6 +193,15 @@ class CameraAnnotator:
 
         # Substrate HSV (auto-detected)
         self.substrate_hsv: Optional[Tuple[int, int, int]] = None
+
+        # Click-to-calibrate substrate state
+        self.calibrate_mode = False
+        self.substrate_calibration: Optional[dict] = None
+        self.substrate_source = "none"  # none | auto | clicks
+        # id(Point) -> raw HSV patch pixels cached at click time (the live
+        # frame buffer is replaced every 33 ms, so recomputation must not
+        # resample current_image)
+        self._substrate_pixels: Dict[int, np.ndarray] = {}
 
         # Display settings
         self.zoom_level = 1.0
@@ -144,6 +245,7 @@ class CameraAnnotator:
 
         # Canvas events
         self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<Shift-Button-1>", self._on_substrate_click)
         self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<B2-Motion>", self._on_pan_drag)
@@ -202,8 +304,17 @@ class CameraAnnotator:
         )
         self.btn_detect_substrate.pack(pady=5, padx=5, fill=tk.X)
 
+        self.btn_calibrate_substrate = ttk.Button(
+            substrate_frame, text="Calibrate Substrate (click mode)",
+            command=self._toggle_calibrate_mode
+        )
+        self.btn_calibrate_substrate.pack(pady=2, padx=5, fill=tk.X)
+
         self.substrate_hsv_label = ttk.Label(substrate_frame, text="Not detected")
-        self.substrate_hsv_label.pack(pady=5)
+        self.substrate_hsv_label.pack(pady=2)
+
+        self.substrate_count_label = ttk.Label(substrate_frame, text="")
+        self.substrate_count_label.pack(pady=(0, 5))
 
         # Camera settings
         settings_frame = ttk.LabelFrame(parent, text="Camera Settings")
@@ -255,10 +366,12 @@ class CameraAnnotator:
 
         instructions = (
             "Left-click: Add point (records HSV)\n"
+            "Shift-click: Add substrate sample\n"
+            "Calibrate toggle: clicks = substrate\n"
             "Right-click: Remove last point\n"
             "Mouse wheel: Zoom in/out\n"
             "Middle mouse drag: Pan\n"
-            "Auto-Detect Substrate HSV first!"
+            "Calibrate or Auto-Detect substrate first!"
         )
         ttk.Label(instructions_frame, text=instructions, justify=tk.LEFT).pack(padx=5, pady=5, anchor=tk.W)
 
@@ -689,22 +802,32 @@ class CameraAnnotator:
         scale_x = params["width"] / params["orig_width"]
         scale_y = params["height"] / params["orig_height"]
 
-        for i, point in enumerate(self.points):
+        flake_idx = 0
+        substrate_idx = 0
+        for point in self.points:
             # Convert original coordinates to display coordinates
             disp_x = int(point.x * scale_x) + params["x"]
             disp_y = int(point.y * scale_y) + params["y"]
 
+            # Substrate samples render cyan (S1..), flake seeds red (#1..)
+            if point.label == "substrate":
+                substrate_idx += 1
+                fill, text, text_fill = "cyan", f"S{substrate_idx}", "cyan"
+            else:
+                flake_idx += 1
+                fill, text, text_fill = "red", f"#{flake_idx}", "yellow"
+
             # Draw marker
             self.canvas.create_oval(
                 disp_x - 5, disp_y - 5, disp_x + 5, disp_y + 5,
-                fill="red", outline="white", width=2
+                fill=fill, outline="white", width=2
             )
 
             # Draw label
             self.canvas.create_text(
                 disp_x + 10, disp_y - 10,
-                text=f"#{i+1}",
-                fill="yellow", font=("Arial", 10, "bold")
+                text=text,
+                fill=text_fill, font=("Arial", 10, "bold")
             )
 
     # ------------------------------------------------------------------
@@ -732,11 +855,8 @@ class CameraAnnotator:
             v_sub = int(np.argmax(v_hist))
 
             self.substrate_hsv = (h_sub, s_sub, v_sub)
-
-            # Update label
-            self.substrate_hsv_label.config(
-                text=f"H={h_sub}, S={s_sub}, V={v_sub}"
-            )
+            self.substrate_source = "auto"
+            self._update_substrate_labels()
 
             logger.info(f"Substrate HSV detected: H={h_sub}, S={s_sub}, V={v_sub}")
 
@@ -745,11 +865,109 @@ class CameraAnnotator:
             messagebox.showerror("Error", f"Failed to detect substrate HSV: {e}")
 
     # ------------------------------------------------------------------
+    # Click-to-Calibrate Substrate
+    # ------------------------------------------------------------------
+
+    def _toggle_calibrate_mode(self):
+        """Toggle click-to-calibrate substrate mode."""
+        self.calibrate_mode = not self.calibrate_mode
+        if self.calibrate_mode:
+            self.btn_calibrate_substrate.config(
+                text="Stop Calibrating (clicks = substrate)"
+            )
+            self.status_bar.config(
+                text="Status: Calibrate mode — click bare substrate regions"
+            )
+        else:
+            self.btn_calibrate_substrate.config(
+                text="Calibrate Substrate (click mode)"
+            )
+            self.status_bar.config(text="Status: Calibrate mode off")
+        logger.info(f"Calibrate mode: {'on' if self.calibrate_mode else 'off'}")
+
+    def _on_substrate_click(self, event):
+        """Handle a substrate-calibration click (Shift-click or calibrate mode)."""
+        if self.current_image is None:
+            return
+
+        orig_x, orig_y = self._display_to_original(event.x, event.y)
+
+        # Ignore clicks on the letterbox/outside the image
+        if not (0 <= orig_x < self.current_image.shape[1]
+                and 0 <= orig_y < self.current_image.shape[0]):
+            return
+
+        self._add_substrate_sample(orig_x, orig_y)
+
+    def _add_substrate_sample(self, orig_x: int, orig_y: int):
+        """Sample a substrate patch at click time and update the calibration."""
+        pixels = extract_hsv_patch(
+            self.current_image, orig_x, orig_y, radius=SUBSTRATE_PATCH_RADIUS
+        )
+        median_hsv = tuple(int(v) for v in np.median(pixels, axis=0))
+
+        point = Point(orig_x, orig_y, hsv=median_hsv, label="substrate")
+        self.points.append(point)
+        self._substrate_pixels[id(point)] = pixels
+
+        self._recompute_substrate_calibration()
+        self._update_points_list()
+        self._update_display()
+
+        logger.info(
+            f"Added substrate sample: ({orig_x}, {orig_y}) HSV: {median_hsv}"
+        )
+
+    def _recompute_substrate_calibration(self):
+        """Rebuild the substrate calibration from all substrate samples."""
+        arrays = []
+        for point in self.points:
+            if point.label != "substrate":
+                continue
+            cached = self._substrate_pixels.get(id(point))
+            if cached is not None:
+                arrays.append(cached)
+            elif point.hsv:
+                # Loaded from JSON without raw pixels: 1-pixel sample
+                arrays.append(np.array([point.hsv], dtype=np.float32))
+
+        self.substrate_calibration = compute_calibration_from_samples(arrays)
+
+        if self.substrate_calibration:
+            self.substrate_source = "clicks"
+            peak = self.substrate_calibration["peak"]
+            self.substrate_hsv = tuple(int(round(c)) for c in peak)
+        elif self.substrate_source == "clicks":
+            # Last substrate sample was removed
+            self.substrate_source = "none"
+            self.substrate_hsv = None
+
+        self._update_substrate_labels()
+
+    def _update_substrate_labels(self):
+        """Refresh the substrate HSV value + provenance labels."""
+        if self.substrate_hsv:
+            h, s, v = self.substrate_hsv
+            self.substrate_hsv_label.config(text=f"H={h}, S={s}, V={v}")
+        else:
+            self.substrate_hsv_label.config(text="Not detected")
+
+        if self.substrate_source == "clicks" and self.substrate_calibration:
+            n = self.substrate_calibration["n_samples"]
+            self.substrate_count_label.config(text=f"Calibrated ({n} clicks)")
+        elif self.substrate_source == "auto":
+            self.substrate_count_label.config(text="Auto-detected")
+        else:
+            self.substrate_count_label.config(text="")
+
+    # ------------------------------------------------------------------
     # Event Handlers
     # ------------------------------------------------------------------
 
     def _on_canvas_click(self, event):
         """Handle left-click to add point with HSV."""
+        if self.calibrate_mode:
+            return self._on_substrate_click(event)
         if self.current_image is None:
             return
 
@@ -786,6 +1004,9 @@ class CameraAnnotator:
         """Handle right-click to remove last point."""
         if self.points:
             removed = self.points.pop()
+            self._substrate_pixels.pop(id(removed), None)
+            if removed.label == "substrate":
+                self._recompute_substrate_calibration()
             self._update_points_list()
             self._update_display()
             logger.info(f"Removed point: ({removed.x}, {removed.y})")
@@ -874,17 +1095,26 @@ class CameraAnnotator:
     def _update_points_list(self):
         """Update the points listbox with HSV values."""
         self.points_listbox.delete(0, tk.END)
-        for i, point in enumerate(self.points):
+        flake_idx = 0
+        substrate_idx = 0
+        for point in self.points:
+            if point.label == "substrate":
+                substrate_idx += 1
+                prefix, suffix = f"S{substrate_idx}", "  [substrate]"
+            else:
+                flake_idx += 1
+                prefix, suffix = f"#{flake_idx}", ""
+
             if point.hsv:
                 h, s, v = point.hsv
                 self.points_listbox.insert(
                     tk.END,
-                    f"#{i+1}: ({point.x}, {point.y})  HSV: ({h}, {s}, {v})"
+                    f"{prefix}: ({point.x}, {point.y})  HSV: ({h}, {s}, {v}){suffix}"
                 )
             else:
                 self.points_listbox.insert(
                     tk.END,
-                    f"#{i+1}: ({point.x}, {point.y})"
+                    f"{prefix}: ({point.x}, {point.y}){suffix}"
                 )
 
     def _save_points(self):
@@ -900,14 +1130,15 @@ class CameraAnnotator:
 
         if file_path:
             try:
-                data = {
-                    "points": [p.to_dict() for p in self.points],
-                    "substrate_hsv": list(self.substrate_hsv) if self.substrate_hsv else None,
-                    "image_size": (
+                data = build_points_payload(
+                    self.points,
+                    self.substrate_calibration,
+                    image_size=(
                         self.current_image.shape[1],
                         self.current_image.shape[0]
                     ) if self.current_image is not None else None,
-                }
+                    fallback_substrate_hsv=self.substrate_hsv,
+                )
 
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=2)
@@ -928,15 +1159,20 @@ class CameraAnnotator:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
 
-                self.points = [Point.from_dict(p) for p in data.get("points", [])]
+                self.points, self.substrate_calibration = parse_points_payload(data)
+                self._substrate_pixels.clear()
 
-                # Load substrate HSV if present
-                substrate = data.get("substrate_hsv")
-                if substrate:
-                    self.substrate_hsv = tuple(substrate)
-                    self.substrate_hsv_label.config(
-                        text=f"H={substrate[0]}, S={substrate[1]}, V={substrate[2]}"
-                    )
+                if self.substrate_calibration:
+                    self.substrate_source = "clicks"
+                    peak = self.substrate_calibration["peak"]
+                    self.substrate_hsv = tuple(int(round(c)) for c in peak)
+                else:
+                    # Legacy file: peak only, provenance unknown -> auto
+                    substrate = data.get("substrate_hsv")
+                    if substrate:
+                        self.substrate_hsv = tuple(substrate)
+                        self.substrate_source = "auto"
+                self._update_substrate_labels()
 
                 self._update_points_list()
                 self._update_display()
@@ -951,6 +1187,8 @@ class CameraAnnotator:
         if self.points:
             if messagebox.askyesno("Confirm", "Clear all points?"):
                 self.points.clear()
+                self._substrate_pixels.clear()
+                self._recompute_substrate_calibration()
                 self._update_points_list()
                 self._update_display()
                 logger.info("Cleared all points")
