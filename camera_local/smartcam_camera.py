@@ -359,7 +359,7 @@ class SmartCamCamera:
                 pattern = "rggb"
             w, h = res or ((1920, 960) if kind == "packed12" else (3840, 2160))
             if kind in ("bayer16", "yuy2", "uyvy", "gray16", "gray8",
-                        "bayer8", "packed12"):
+                        "bayer8", "packed12", "nv12"):
                 fmt: Dict[str, Any] = {"kind": kind, "w": w, "h": h}
                 if kind in ("bayer16", "bayer8", "packed12"):
                     fmt["pattern"] = pattern
@@ -415,6 +415,12 @@ class SmartCamCamera:
                 add("uyvy", w, h)
                 add("gray16", w, h)
 
+        # NV12 (YUV420 semi-planar) — 3,110,400 bytes = 1920x1080x1.5.
+        # User confirmed this decode looks accurate.
+        for w, h in [(1920, 1080), (3840, 2160)]:
+            if n == w * h * 3 // 2:
+                add("nv12", w, h)
+
         # 12-bit packed interpretations (3 bytes per 2 pixels).
         # Byte analysis showed the actual data extent is ~3,110,400 bytes
         # = 1920x1080 12-bit packed. Only add when the buffer size EXACTLY
@@ -453,12 +459,35 @@ class SmartCamCamera:
             if kind == "gray8":
                 gray = raw[: w * h].reshape(h, w)
                 return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            if kind == "nv12":
+                # NV12: Y plane (h*w) + interleaved UV (h*w/2)
+                nv12 = raw[: w * h * 3 // 2].reshape(h * 3 // 2, w)
+                return cv2.cvtColor(nv12, cv2.COLOR_YUV2RGB_NV12)
             if kind == "packed12":
                 img12 = _unpack12(raw[: w * h * 3 // 2], w, h)
                 bayer8 = (img12 >> 4).astype(np.uint8)
-                return cv2.cvtColor(
-                    bayer8, _LITERAL_BAYER_TO_CV2[fmt["pattern"]]
-                )
+                # Allow manual override via SMARTCAM_PIXEL_FORMAT
+                if self._forced_format_str and "packed12" in self._forced_format_str:
+                    pattern = fmt.get("pattern", "rggb")
+                    code = _LITERAL_BAYER_TO_CV2.get(pattern)
+                    if code:
+                        return cv2.cvtColor(bayer8, code)
+                # Try all 4 Bayer patterns, pick the one with most
+                # natural-looking colors (highest R/G/B variance)
+                best_rgb, best_var = None, -1
+                for lit, code in _LITERAL_BAYER_TO_CV2.items():
+                    try:
+                        rgb = cv2.cvtColor(bayer8, code)
+                        r, g, b = cv2.split(rgb)
+                        var = float(np.var([r.mean(), g.mean(), b.mean()]))
+                        if var > best_var:
+                            best_var = var
+                            best_rgb = rgb
+                    except Exception:
+                        pass
+                if best_rgb is not None:
+                    return best_rgb
+                return None
             logger.error("Unknown format kind %r", kind)
             return None
         except Exception as e:
@@ -477,12 +506,15 @@ class SmartCamCamera:
         n = int(raw.size)
 
         # KNOWN-CORRECT FORMAT: The Axiocam 208 live view is 1920x1080
-        # grayscale 8-bit (confirmed by user inspection of decoded frames).
-        # The buffer is a fixed 16,588,800-byte allocation with the actual
-        # frame in the first 2,073,600 bytes. Skip coherence scoring for
-        # this known format to avoid false positives from packed12.
+        # NV12 (YUV420 semi-planar) — user confirmed this looks accurate.
+        # The buffer is trimmed to 3,110,400 bytes in _decode().
+        if n == 1920 * 1080 * 3 // 2:
+            logger.info("Using known format: nv12 1920x1080")
+            return {"kind": "nv12", "w": 1920, "h": 1080}
+
+        # Fallback: grayscale 8-bit for any other size
         if n >= 1920 * 1080:
-            logger.info("Using known format: gray8 1920x1080")
+            logger.info("Using fallback format: gray8 1920x1080")
             return {"kind": "gray8", "w": 1920, "h": 1080}
 
         cands = self._candidate_formats(n)
