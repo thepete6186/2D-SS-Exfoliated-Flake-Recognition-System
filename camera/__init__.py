@@ -10,6 +10,14 @@ from .zeiss_camera import ZeissCamera, CameraError
 from .mmcore_camera import MMCoreCamera, CameraInfo
 from .calibration import CalibrationManager, CalibrationError
 from .coordinate_mapper import CoordinateMapper
+from .camera_stage_orchestrator import (
+    AlignmentMapper,
+    AlignmentSettings,
+    AlignmentSettingsStore,
+    CameraSession,
+    CameraStageOrchestrator,
+    StageSession,
+)
 
 __all__ = [
     "ZeissCamera",
@@ -19,4 +27,10 @@ __all__ = [
     "CalibrationManager",
     "CalibrationError",
     "CoordinateMapper",
+    "AlignmentMapper",
+    "AlignmentSettings",
+    "AlignmentSettingsStore",
+    "CameraSession",
+    "CameraStageOrchestrator",
+    "StageSession",
 ]

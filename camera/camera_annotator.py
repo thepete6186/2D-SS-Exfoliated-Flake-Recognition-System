@@ -35,6 +35,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from camera.zeiss_camera import ZeissCamera, CameraError
 from camera.mmcore_camera import MMCoreCamera
 from camera.smartcam_camera import SmartCamCamera
+from camera.calibration import CalibrationManager
+from camera.coordinate_mapper import CoordinateMapper
+from camera.camera_stage_orchestrator import (
+    AlignmentMapper,
+    AlignmentSettings,
+    AlignmentSettingsStore,
+    CameraStageOrchestrator,
+    StageSession,
+)
+from stage import SimulatedStage, ZolixZC300
 
 # 'hsv-pipeline-semi' is hyphenated -> not a package; import by path
 # (same pattern as tests/test_hsv_signature.py)
@@ -181,6 +191,33 @@ class CameraAnnotator:
         self.camera_backend = "auto"  # "auto", "gentl", "opencv", "mmcore", "smartcam"
         self.mm_config_path = None  # Path to Micro-Manager config
 
+        # Alignment/stage settings + orchestrator
+        self.alignment_settings_store = AlignmentSettingsStore(
+            Path(__file__).parent / "alignment_settings.json"
+        )
+        self.alignment_settings = self.alignment_settings_store.load()
+        self.alignment_clicks: List[Tuple[int, int]] = []
+        self.calibration_manager = CalibrationManager()
+        if self.alignment_settings.calibration_name in self.calibration_manager.list_calibrations():
+            self.calibration_manager.set_active(self.alignment_settings.calibration_name)
+        self.coordinate_mapper = CoordinateMapper(
+            self.calibration_manager,
+            stage_config={
+                "zolix": {
+                    "xy_um_per_step": self.alignment_settings.xy_um_per_step,
+                    "r_deg_per_step": 0.01,
+                }
+            },
+        )
+        self.alignment_mapper = AlignmentMapper(self.coordinate_mapper)
+        self.stage_session = StageSession(stage_factory=self._create_stage_from_settings)
+        self.orchestrator = CameraStageOrchestrator(
+            stage_session=self.stage_session,
+            alignment_mapper=self.alignment_mapper,
+            settings_provider=self._get_alignment_settings,
+            on_event=self._on_orchestrator_event,
+        )
+
         # Background capture thread state
         self._capture_thread = None
         self._capture_stop = threading.Event()
@@ -220,6 +257,7 @@ class CameraAnnotator:
 
         # Start frame update loop
         self._update_frame()
+        self._poll_stage_status()
 
     # ------------------------------------------------------------------
     # GUI Building
@@ -344,6 +382,98 @@ class CameraAnnotator:
         self.gain_label = ttk.Label(settings_frame, text="0.0 dB")
         self.gain_label.pack(anchor=tk.E, padx=5)
 
+        # Stage + alignment controls
+        stage_frame = ttk.LabelFrame(parent, text="Stage + Alignment")
+        stage_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.alignment_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            stage_frame,
+            text="Alignment mode (click-to-move)",
+            variable=self.alignment_mode_var,
+        ).pack(anchor=tk.W, padx=5, pady=(5, 2))
+
+        self.use_sim_stage_var = tk.BooleanVar(value=self.alignment_settings.use_simulated_stage)
+        ttk.Checkbutton(
+            stage_frame,
+            text="Use simulated stage",
+            variable=self.use_sim_stage_var,
+            command=self._save_alignment_settings_from_ui,
+        ).pack(anchor=tk.W, padx=5, pady=2)
+
+        port_row = ttk.Frame(stage_frame)
+        port_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(port_row, text="Port").pack(side=tk.LEFT)
+        self.stage_port_var = tk.StringVar(value=self.alignment_settings.stage_port)
+        ttk.Entry(port_row, textvariable=self.stage_port_var, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(port_row, text="Slave").pack(side=tk.LEFT)
+        self.stage_slave_var = tk.IntVar(value=self.alignment_settings.stage_slave)
+        ttk.Spinbox(port_row, from_=1, to=247, textvariable=self.stage_slave_var, width=5).pack(side=tk.LEFT, padx=5)
+
+        cal_row = ttk.Frame(stage_frame)
+        cal_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(cal_row, text="Calibration").pack(side=tk.LEFT)
+        cals = self.calibration_manager.list_calibrations() or ["default"]
+        initial_cal = self.alignment_settings.calibration_name if self.alignment_settings.calibration_name in cals else cals[0]
+        self.calibration_name_var = tk.StringVar(value=initial_cal)
+        cal_combo = ttk.Combobox(
+            cal_row, textvariable=self.calibration_name_var, state="readonly", values=cals, width=14
+        )
+        cal_combo.pack(side=tk.LEFT, padx=5)
+        cal_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_alignment_settings_from_ui())
+
+        profile_row = ttk.Frame(stage_frame)
+        profile_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(profile_row, text="Stage profile").pack(side=tk.LEFT)
+        self.stage_profile_var = tk.StringVar(value=self.alignment_settings.stage_profile)
+        profile_combo = ttk.Combobox(
+            profile_row, textvariable=self.stage_profile_var, state="readonly", values=("zolix",), width=10
+        )
+        profile_combo.pack(side=tk.LEFT, padx=5)
+        profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_alignment_settings_from_ui())
+
+        self.xy_um_per_step_var = tk.DoubleVar(value=self.alignment_settings.xy_um_per_step)
+        ttk.Label(profile_row, text="µm/step").pack(side=tk.LEFT)
+        ttk.Entry(profile_row, textvariable=self.xy_um_per_step_var, width=8).pack(side=tk.LEFT, padx=5)
+
+        orient_row = ttk.Frame(stage_frame)
+        orient_row.pack(fill=tk.X, padx=5, pady=2)
+        self.invert_x_var = tk.BooleanVar(value=self.alignment_settings.invert_x)
+        self.invert_y_var = tk.BooleanVar(value=self.alignment_settings.invert_y)
+        self.flip_xy_var = tk.BooleanVar(value=self.alignment_settings.flip_xy)
+        ttk.Checkbutton(
+            orient_row, text="Invert X", variable=self.invert_x_var, command=self._save_alignment_settings_from_ui
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            orient_row, text="Invert Y", variable=self.invert_y_var, command=self._save_alignment_settings_from_ui
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            orient_row, text="Flip XY", variable=self.flip_xy_var, command=self._save_alignment_settings_from_ui
+        ).pack(side=tk.LEFT)
+
+        stage_btn_row = ttk.Frame(stage_frame)
+        stage_btn_row.pack(fill=tk.X, padx=5, pady=(4, 2))
+        self.btn_stage_connect = ttk.Button(
+            stage_btn_row, text="Connect Stage", command=self._toggle_stage_connection
+        )
+        self.btn_stage_connect.pack(side=tk.LEFT)
+        ttk.Button(
+            stage_btn_row, text="Home All", command=lambda: self._queue_home("all")
+        ).pack(side=tk.LEFT, padx=5)
+
+        jog_row = ttk.Frame(stage_frame)
+        jog_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(jog_row, text="Jog step").pack(side=tk.LEFT)
+        self.jog_steps_var = tk.IntVar(value=self.alignment_settings.jog_steps)
+        ttk.Entry(jog_row, textvariable=self.jog_steps_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Button(jog_row, text="X-", command=lambda: self._queue_jog("x", -1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(jog_row, text="X+", command=lambda: self._queue_jog("x", +1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(jog_row, text="Y-", command=lambda: self._queue_jog("y", -1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(jog_row, text="Y+", command=lambda: self._queue_jog("y", +1)).pack(side=tk.LEFT, padx=2)
+
+        self.stage_status_label = ttk.Label(stage_frame, text="Stage: Disconnected")
+        self.stage_status_label.pack(anchor=tk.W, padx=5, pady=(2, 5))
+
         # Points section
         points_frame = ttk.LabelFrame(parent, text="Clicked Points (with HSV)")
         points_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -366,6 +496,7 @@ class CameraAnnotator:
 
         instructions = (
             "Left-click: Add point (records HSV)\n"
+            "Alignment mode: click to enqueue stage move\n"
             "Shift-click: Add substrate sample\n"
             "Calibrate toggle: clicks = substrate\n"
             "Right-click: Remove last point\n"
@@ -374,6 +505,115 @@ class CameraAnnotator:
             "Calibrate or Auto-Detect substrate first!"
         )
         ttk.Label(instructions_frame, text=instructions, justify=tk.LEFT).pack(padx=5, pady=5, anchor=tk.W)
+
+    # ------------------------------------------------------------------
+    # Stage + Alignment Orchestration
+    # ------------------------------------------------------------------
+
+    def _get_alignment_settings(self) -> AlignmentSettings:
+        """Read alignment settings from UI vars (or last loaded defaults)."""
+        if not hasattr(self, "stage_profile_var"):
+            return self.alignment_settings
+
+        calibration_name = self.calibration_name_var.get().strip() or "default"
+        if calibration_name in self.calibration_manager.list_calibrations():
+            self.calibration_manager.set_active(calibration_name)
+
+        settings = AlignmentSettings(
+            stage_profile=self.stage_profile_var.get().strip() or "zolix",
+            calibration_name=calibration_name,
+            invert_x=bool(self.invert_x_var.get()),
+            invert_y=bool(self.invert_y_var.get()),
+            flip_xy=bool(self.flip_xy_var.get()),
+            xy_um_per_step=float(self.xy_um_per_step_var.get()),
+            jog_steps=max(1, int(self.jog_steps_var.get())),
+            use_simulated_stage=bool(self.use_sim_stage_var.get()),
+            stage_port=self.stage_port_var.get().strip() or "COM3",
+            stage_slave=max(1, min(247, int(self.stage_slave_var.get()))),
+        )
+        return settings
+
+    def _save_alignment_settings_from_ui(self):
+        """Persist alignment settings to JSON."""
+        try:
+            self.alignment_settings = self._get_alignment_settings()
+            self.alignment_settings_store.save(self.alignment_settings)
+        except Exception as e:
+            logger.warning(f"Failed to persist alignment settings: {e}")
+
+    def _create_stage_from_settings(self):
+        """Build real or simulated stage using current persisted settings."""
+        settings = self._get_alignment_settings()
+        if settings.use_simulated_stage:
+            return SimulatedStage()
+        return ZolixZC300(port=settings.stage_port, slave_address=settings.stage_slave)
+
+    def _toggle_stage_connection(self):
+        """Connect/disconnect stage through orchestrator."""
+        self._save_alignment_settings_from_ui()
+        if self.stage_session.is_connected:
+            self.orchestrator.disconnect_stage()
+        else:
+            self.orchestrator.connect_stage()
+
+    def _queue_home(self, axis: str = "all"):
+        """Enqueue stage homing."""
+        if not self.stage_session.is_connected:
+            messagebox.showwarning("Stage not connected", "Connect stage first.")
+            return
+        self.orchestrator.enqueue_home(axis)
+
+    def _queue_jog(self, axis: str, direction: int):
+        """Enqueue axis jog move."""
+        if not self.stage_session.is_connected:
+            messagebox.showwarning("Stage not connected", "Connect stage first.")
+            return
+        self._save_alignment_settings_from_ui()
+        steps = max(1, int(self.jog_steps_var.get())) * int(direction)
+        self.orchestrator.enqueue_jog(axis, steps)
+
+    def _poll_stage_status(self):
+        """Periodic status polling for stage display refresh."""
+        if self.stage_session.is_connected:
+            self.orchestrator.enqueue_status()
+        self.root.after(500, self._poll_stage_status)
+
+    def _on_orchestrator_event(self, event_type: str, payload: Dict[str, object]):
+        """Thread-safe bridge from orchestrator worker -> Tk main loop."""
+        self.root.after(0, self._handle_orchestrator_event, event_type, payload)
+
+    def _handle_orchestrator_event(self, event_type: str, payload: Dict[str, object]):
+        """Handle stage orchestration events on the Tk thread."""
+        if event_type == CameraStageOrchestrator.STAGE_STATUS:
+            status = payload.get("status")
+            if status is None:
+                self.btn_stage_connect.config(text="Connect Stage")
+                self.stage_status_label.config(text="Stage: Disconnected")
+                return
+            self.btn_stage_connect.config(text="Disconnect Stage")
+            pos = status.get("position", {})
+            moving = status.get("moving", {})
+            self.stage_status_label.config(
+                text=(
+                    f"Stage: X={pos.get('x', 0):.1f} Y={pos.get('y', 0):.1f} "
+                    f"R={pos.get('r', 0):.1f} | moving={any(moving.values())}"
+                )
+            )
+        elif event_type == CameraStageOrchestrator.MOVE_STARTED:
+            self.status_bar.config(text=f"Stage move started: {payload.get('kind')}")
+        elif event_type == CameraStageOrchestrator.MOVE_DONE:
+            if payload.get("kind") == "MOVE_CLICK":
+                cmd = payload.get("command", {})
+                self.status_bar.config(
+                    text=(
+                        f"Move done: steps=({cmd.get('steps_x', 0)}, {cmd.get('steps_y', 0)}) "
+                        f"nm=({cmd.get('dx_nm', 0):.1f}, {cmd.get('dy_nm', 0):.1f})"
+                    )
+                )
+            else:
+                self.status_bar.config(text=f"Stage move done: {payload.get('kind')}")
+        elif event_type == CameraStageOrchestrator.STAGE_ERROR:
+            self.status_bar.config(text=f"Stage error: {payload.get('error', 'Unknown error')}")
 
     # ------------------------------------------------------------------
     # Camera Connection
@@ -830,6 +1070,21 @@ class CameraAnnotator:
                 fill=text_fill, font=("Arial", 10, "bold")
             )
 
+        # Alignment click history (most recent in green)
+        recent_moves = self.alignment_clicks[-20:]
+        for idx, (mx, my) in enumerate(recent_moves, start=1):
+            disp_x = int(mx * scale_x) + params["x"]
+            disp_y = int(my * scale_y) + params["y"]
+            self.canvas.create_oval(
+                disp_x - 4, disp_y - 4, disp_x + 4, disp_y + 4,
+                outline="lime", width=2
+            )
+            self.canvas.create_text(
+                disp_x + 9, disp_y + 9,
+                text=f"M{idx}",
+                fill="lime", font=("Arial", 9, "bold")
+            )
+
     # ------------------------------------------------------------------
     # Substrate HSV Detection
     # ------------------------------------------------------------------
@@ -968,6 +1223,8 @@ class CameraAnnotator:
         """Handle left-click to add point with HSV."""
         if self.calibrate_mode:
             return self._on_substrate_click(event)
+        if hasattr(self, "alignment_mode_var") and self.alignment_mode_var.get():
+            return self._on_alignment_click(event)
         if self.current_image is None:
             return
 
@@ -999,6 +1256,37 @@ class CameraAnnotator:
         self._update_display()
 
         logger.info(f"Added point: ({orig_x}, {orig_y}) HSV: {hsv_value}")
+
+    def _on_alignment_click(self, event):
+        """Handle click-to-move alignment action."""
+        if self.current_image is None:
+            return
+        if not self.stage_session.is_connected:
+            messagebox.showwarning("Stage not connected", "Connect stage before alignment moves.")
+            return
+
+        orig_x, orig_y = self._display_to_original(event.x, event.y)
+        if not (0 <= orig_x < self.current_image.shape[1]
+                and 0 <= orig_y < self.current_image.shape[0]):
+            return
+
+        self._save_alignment_settings_from_ui()
+        image_size = (self.current_image.shape[1], self.current_image.shape[0])
+        cmd = self.alignment_mapper.pixel_to_stage_command(
+            orig_x, orig_y, image_size, self._get_alignment_settings()
+        )
+        self.alignment_clicks.append((orig_x, orig_y))
+        if len(self.alignment_clicks) > 50:
+            self.alignment_clicks = self.alignment_clicks[-50:]
+
+        self.orchestrator.enqueue_click_move(orig_x, orig_y, image_size)
+        self.status_bar.config(
+            text=(
+                f"Queued move: click=({orig_x}, {orig_y}) "
+                f"steps=({cmd['steps_x']}, {cmd['steps_y']})"
+            )
+        )
+        self._update_display()
 
     def _on_right_click(self, event):
         """Handle right-click to remove last point."""
@@ -1199,6 +1487,12 @@ class CameraAnnotator:
 
     def cleanup(self):
         """Cleanup resources."""
+        self._save_alignment_settings_from_ui()
+        try:
+            self.orchestrator.disconnect_stage()
+            self.orchestrator.close()
+        except Exception:
+            pass
         self._disconnect_camera()
         self.root.destroy()
 
