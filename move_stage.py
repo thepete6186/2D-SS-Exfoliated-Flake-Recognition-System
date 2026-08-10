@@ -56,7 +56,7 @@ def print_status(stage: Stage) -> None:
             print(f"  LIMIT: {key}")
 
 
-def main() -> int:
+def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="Zolix ZC300 CLI")
     parser.add_argument("--port", default="COM3", help="Serial port (default COM3)")
     parser.add_argument("--simulate", action="store_true", help="Use SimulatedStage (no hardware)")
@@ -83,7 +83,7 @@ def main() -> int:
     p_speed.add_argument("axis", choices=AXES)
     p_speed.add_argument("pps", type=float)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     stage = build_stage(args.port, args.simulate)
     try:

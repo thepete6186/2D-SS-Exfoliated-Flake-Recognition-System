@@ -100,6 +100,10 @@ class Stage(abc.ABC):
     def stop(self, axis: str = "all") -> None:
         """Stop one axis or all axes."""
 
+    @abc.abstractmethod
+    def set_speed(self, axis: str, speed_pps: float) -> None:
+        """Set the constant speed for an axis (pulses/s)."""
+
     # -- status ------------------------------------------------------------
 
     @abc.abstractmethod

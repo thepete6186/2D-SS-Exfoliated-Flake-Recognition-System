@@ -89,3 +89,23 @@ def test_status_shape_parity_with_driver():
     assert set(status["position"].keys()) == {"x", "y", "r"}
     assert set(status["limits"].keys()) == {"x+", "x-", "y+", "y-", "r+", "r-"}
     assert status["emergency_stop"] is False
+
+
+def test_set_speed_updates_rate():
+    stage = make_stage(speed_pps=1000.0)
+
+    stage.set_speed("x", 5000.0)
+
+    # A move should now take less time (higher speed)
+    stage.move_relative("x", 100, wait=True, timeout=2.0)
+    assert stage.get_position()["x"] == pytest.approx(100.0)
+
+
+def test_set_speed_invalid_raises():
+    stage = make_stage()
+
+    with pytest.raises(StageError, match="positive"):
+        stage.set_speed("x", 0)
+
+    with pytest.raises(StageError, match="positive"):
+        stage.set_speed("x", -100)

@@ -143,6 +143,15 @@ class SimulatedStage(Stage):
                 if motion is not None:
                     self._positions[ax] = motion.position_at(now)
 
+    def set_speed(self, axis: str, speed_pps: float) -> None:
+        """Set the constant speed for an axis (pulses/s)."""
+        ax = self._validate_axis(axis)
+        self._require_connected()
+        if speed_pps <= 0:
+            raise StageError(f"Speed must be positive, got {speed_pps}")
+        with self._lock:
+            self._speed_pps = float(speed_pps)
+
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------

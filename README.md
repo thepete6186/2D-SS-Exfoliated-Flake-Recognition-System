@@ -133,6 +133,18 @@ print(stage.get_position())             # {'x': ..., 'y': ..., 'r': ...}
 stage.disconnect()
 ```
 
+Quick CLI for scripting stage moves without the GUI:
+
+```
+python move_stage.py --simulate status        # simulated stage, no hardware
+python move_stage.py --port COM3 status
+python move_stage.py --port COM3 rel x 1000   # relative move
+python move_stage.py --port COM3 abs y 25000  # absolute move
+python move_stage.py --port COM3 home all
+python move_stage.py --port COM3 stop
+python move_stage.py --port COM3 speed x 2000
+```
+
 Smoke test on the lab PC (validates the absolute-move and home opcodes,
 which are implemented from the register map but not yet exercised on
 hardware):
@@ -146,6 +158,32 @@ python -m stage.zc300_smoke --port COM3 --jog x 1000
 Adapted from [transfer-stage-control](https://github.com/Lewbert/transfer-stage-control)
 (MIT), with absolute moves, homing, and blocking waits added for
 raster scanning.
+
+---
+
+## 🧪 Testing
+
+Install test dependencies and run the suite:
+
+```bash
+pip install pytest pytest-cov
+python -m pytest tests/ -v
+```
+
+Coverage:
+
+```bash
+python -m pytest tests/ --cov=stage --cov=camera --cov-report=term-missing
+```
+
+The test suite covers:
+- **MODBUS RTU layer** — frame builders, parsers, CRC-16 golden vectors
+- **ZolixZC300 driver** — connect handshake, motion sequences, error mapping (via fake serial port)
+- **SimulatedStage** — position math, soft limits, rate-modeled motion, typed errors
+- **move_stage.py CLI** — all subcommands via `--simulate`
+- **Camera decode** — Bayer/YUY2/GenTL format detection and demosaicing
+- **Annotator payload** — JSON roundtrip and calibration fallback
+- **HSV pipeline** — flake signatures, substrate calibration, CLI override resolution
 
 ---
 

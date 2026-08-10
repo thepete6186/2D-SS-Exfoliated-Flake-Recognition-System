@@ -448,7 +448,13 @@ class ZolixZC300(Stage):
             self._speed_written[axis] = self._default_speed_pps
 
     def _send_frame(self, frame: bytes) -> bytes:
-        """Send one frame and read the reply (reference serial rhythm)."""
+        """Send one frame and read the complete reply.
+
+        Reads until a full MODBUS frame is received (or the serial
+        timeout expires).  A single read() can return partial data on
+        USB-serial adapters, so we accumulate bytes until the frame is
+        complete based on the function code and byte count.
+        """
         if self._ser is None:
             raise StageNotConnectedError("Serial port is not open")
         try:
@@ -456,8 +462,39 @@ class ZolixZC300(Stage):
             self._ser.reset_output_buffer()
             self._ser.write(frame)
             self._ser.flush()
-            time.sleep(0.002)
-            return self._ser.read(256)
+            time.sleep(0.01)  # give the controller time to respond
+
+            response = bytearray()
+            deadline = time.monotonic() + self._timeout * 4
+            while time.monotonic() < deadline:
+                chunk = self._ser.read(256)
+                if chunk:
+                    response.extend(chunk)
+                    # Check if we have a complete frame
+                    if len(response) >= 5:
+                        fc = response[1]
+                        if fc & 0x80:
+                            # Exception response: slave + fc + code + crc(2) = 5 bytes
+                            if len(response) >= 5:
+                                return bytes(response)
+                        elif fc in (0x03, 0x04):
+                            # Read response: slave + fc + byte_count + data + crc(2)
+                            if len(response) >= 3:
+                                byte_count = response[2]
+                                expected = 3 + byte_count + 2
+                                if len(response) >= expected:
+                                    return bytes(response[:expected])
+                        elif fc in (0x06, 0x10):
+                            # Write response: slave + fc + addr(2) + count(2) + crc(2) = 8 bytes
+                            if len(response) >= 8:
+                                return bytes(response[:8])
+                else:
+                    # No more data available in this read cycle
+                    if response:
+                        # We have partial data but no more is coming
+                        return bytes(response)
+                    time.sleep(0.005)
+            return bytes(response)
         except OSError as exc:
             self._connected = False
             raise StageNotConnectedError(f"Serial error: {exc}") from exc
