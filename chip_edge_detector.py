@@ -5,7 +5,7 @@ Chip Edge Detector - Automated chip boundary detection interface.
 Features:
 - Live video feed from SmartCam camera
 - Zolix ZC300 stage control
-- Automated black edge detection with directional scanning
+- Automated color-based edge detection (HSV color space)
 - Real-time scan visualization
 - Stops automatically when edge is found
 
@@ -37,12 +37,12 @@ from camera_local.smartcam_camera import SmartCamCamera
 from stage.zolix_zc300 import ZolixZC300
 from stage.simulated import SimulatedStage
 from stage.base import Stage
-from black_edge_detector import (
-    find_black_edge_point,
-    detect_edge_robust,
-    detect_straight_black_edge,
-    visualize_edge_detection
+from color_edge_detector import (
+    detect_color_edge,
+    visualize_color_edge
 )
+from color_edge_estimator import ColorEdgeEstimator
+from edge_estimation import EdgeAngleEstimator
 from auto_align import AutoAlignController
 from chip_scanner import ChipScanner
 
@@ -91,6 +91,7 @@ class ChipEdgeDetector:
         self.camera_connected = False
         self._capture_thread = None
         self._capture_stop = threading.Event()
+        self._capture_paused = threading.Event()  # blocks bg capture for pipeline/align
         self._latest_frame = None
         self._frame_lock = threading.Lock()
         self._capture_fps = 0.0
@@ -117,8 +118,13 @@ class ChipEdgeDetector:
         self.edge_theta = None
         self.edge_anchor = None
         self.edge_points = []
+        self.edge_reference_point = None  # Reference point set as (0, 0)
         self.scan_direction = tk.StringVar(value="left-to-right")
         self.is_scanning = False
+        
+        # Full pipeline state
+        self.is_pipeline_running = False
+        self.pipeline_start_position = None  # Store starting position for return
 
         # FPS
         self.frame_count = 0
@@ -369,6 +375,26 @@ class ChipEdgeDetector:
             state=tk.DISABLED
         )
         self.btn_stop_align.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
+
+        # Full pipeline: detect, align, and return to origin
+        pipeline_btn_row = ttk.Frame(edge_frame)
+        pipeline_btn_row.pack(fill=tk.X, padx=5, pady=5)
+
+        self.btn_full_pipeline = ttk.Button(
+            pipeline_btn_row,
+            text="Full Pipeline: Detect → Align → Return to (0,0)",
+            command=self._start_full_pipeline,
+            style="Accent.TButton"
+        )
+        self.btn_full_pipeline.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
+
+        self.btn_stop_pipeline = ttk.Button(
+            pipeline_btn_row,
+            text="Stop Pipeline",
+            command=self._stop_pipeline,
+            state=tk.DISABLED
+        )
+        self.btn_stop_pipeline.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
 
         # Edge detection results
         self.edge_result_label = ttk.Label(edge_frame, text="Edge: Not detected")
@@ -721,6 +747,12 @@ class ChipEdgeDetector:
         frame_count = 0
         last_time = time.time()
         while not stop_event.is_set():
+            # SmartCamApi is NOT thread-safe: pipeline/alignment workers do
+            # their own synchronous camera.capture(), so this loop must pause
+            # (and stop touching the camera) while they run.
+            if self._capture_paused.is_set():
+                time.sleep(0.05)
+                continue
             try:
                 data = camera.capture()
                 if data is not None:
@@ -878,6 +910,15 @@ class ChipEdgeDetector:
                 fill="red", outline="white", width=2
             )
 
+            # Draw angle label near the anchor point
+            angle_text = "%.1f deg" % self.edge_theta
+            self.canvas.create_text(
+                disp_x0 + 20, disp_y0 - 20,
+                text=angle_text,
+                fill="red",
+                font=("Arial", 14, "bold")
+            )
+
     def _draw_scale_bar(self):
         """Draw scale bar on canvas if calibration exists."""
         if not hasattr(self, 'display_params'):
@@ -964,18 +1005,30 @@ class ChipEdgeDetector:
             self._set_status("Scanning for chip edge...")
 
             # Get current frame
-            frame_bgr = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2BGR)
+            if self.current_image is None:
+                raise ValueError("No camera frame available")
 
-            # Perform edge detection (returns theta, anchor only)
-            theta, anchor = detect_edge_robust(frame_bgr, scan_direction="horizontal")
+            frame_bgr = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2BGR)
+            h, w = frame_bgr.shape[:2]
+            logger.info(f"Edge detection on frame: {w}x{h}")
+
+            # Use color-based edge detection (HSV color space)
+            # This finds long continuous color boundaries between substrate and stage
+            logger.info("Starting color-based edge detection (HSV)...")
+            theta, anchor, points = detect_color_edge(frame_bgr)
 
             if theta is not None:
-                # Edge found - get points separately
-                theta2, anchor2, points = detect_straight_black_edge(frame_bgr, scan_direction="horizontal")
                 self.edge_detected = True
                 self.edge_theta = theta
                 self.edge_anchor = anchor
-                self.edge_points = points if points else []
+                self.edge_points = points
+                logger.info(
+                    f"Color edge detected: θ={theta:.1f}° at ({anchor[0]:.0f}, {anchor[1]:.0f}) "
+                    f"points={len(points)}"
+                )
+            else:
+                logger.warning("Color edge detection returned None")
+                error_msg = "Edge detection failed - no edge found in image"
 
         except Exception as e:
             error_msg = str(e)
@@ -990,12 +1043,17 @@ class ChipEdgeDetector:
                 self.root.after(0, self._set_status,
                     f"Edge found! θ={theta:.1f}° at ({anchor[0]:.0f}, {anchor[1]:.0f})"
                 )
-                self.root.after(0, self.edge_result_label.config,
+                # Use lambda to pass text argument to config()
+                self.root.after(0, lambda: self.edge_result_label.config(
                     text=f"Edge: θ={theta:.1f}°\nPos: ({anchor[0]:.0f}, {anchor[1]:.0f})\nPoints: {len(self.edge_points)}"
-                )
+                ))
+                # Force canvas redraw so the edge overlay (points + angle line)
+                # is visible immediately after detection.
+                self.root.after(0, self._update_display)
             else:
-                self.root.after(0, self._set_status, "Edge not found")
-                self.root.after(0, self.edge_result_label.config, text="Edge: NOT FOUND")
+                self.root.after(0, self._set_status, "Edge not found - check image or adjust detection parameters")
+                self.root.after(0, lambda: self.edge_result_label.config(text="Edge: NOT FOUND"))
+                self.root.after(0, lambda: self.edge_result_label.config(text="Edge: NOT FOUND"))
 
             self.root.after(0, lambda: self.btn_detect_edge.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.btn_stop_scan.config(state=tk.DISABLED))
@@ -1032,14 +1090,26 @@ class ChipEdgeDetector:
     def _auto_align_worker(self):
         """Worker thread for auto-alignment."""
         try:
+            # SmartCamApi is not thread-safe -- pause background capture while
+            # this worker does its own synchronous camera captures.
+            self._capture_paused.set()
             self._set_status("Starting auto-alignment...")
 
-            # Create alignment controller
+            # Create alignment controller with COLOR-BASED edge estimator
+            # This ensures the auto-alignment uses the same detector as the GUI
+            color_estimator = ColorEdgeEstimator(min_line_length=100)
+            logger.info(f"Created ColorEdgeEstimator: {color_estimator}")
+            logger.info(f"Estimator type: {type(color_estimator).__name__}")
+            
             controller = AutoAlignController(
                 camera=self.camera,
                 stage=self.stage,
-                rotation_axis="r"
+                rotation_axis="r",
+                estimator=color_estimator,  # Use color-based detection
+                frame_is_rgb=False  # SmartCam returns RGB, but color_estimator handles conversion
             )
+            
+            logger.info(f"Controller estimator type: {type(controller.estimator).__name__}")
 
             # Progress callback
             def progress_callback(iteration, angle, correction, converged):
@@ -1049,11 +1119,12 @@ class ChipEdgeDetector:
                     msg = f"Iteration {iteration}: angle={angle:.1f}°, correction={correction:.1f}°"
                 self.root.after(0, lambda: self._set_status(msg))
 
-            # Run alignment
+            # Run alignment. Single-shot: full correction per pass, verify on
+            # the next capture. Only rotation_step_deg (safety cap, default 45)
+            # is accepted so the GUI never forces 5-deg incremental steps.
             success, message = controller.align(
                 max_iterations=10,
                 tolerance_deg=2.0,
-                rotation_step_deg=5.0,
                 progress_callback=progress_callback
             )
 
@@ -1069,14 +1140,251 @@ class ChipEdgeDetector:
             logger.error(f"Auto-alignment error: {e}", exc_info=True)
             self.root.after(0, lambda: self._set_status(f"Alignment error: {e}"))
         finally:
+            self._capture_paused.clear()
             self.is_scanning = False
             self.root.after(0, lambda: self.btn_align.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.btn_stop_align.config(state=tk.DISABLED))
             self.root.after(0, lambda: self.btn_detect_edge.config(state=tk.NORMAL))
 
     # ------------------------------------------------------------------
-    # Manual Area Scan
+    # Full Pipeline: Detect → Align → Return to Origin
     # ------------------------------------------------------------------
+
+    def _start_full_pipeline(self):
+        """Start the full pipeline: save current position as (0,0), detect edge, align, return."""
+        if not self.camera_connected or self.current_image is None:
+            messagebox.showwarning("Warning", "Camera not connected")
+            return
+
+        if not self._require_stage_connected():
+            return
+
+        self.is_pipeline_running = True
+        self.btn_full_pipeline.config(state=tk.DISABLED)
+        self.btn_stop_pipeline.config(state=tk.NORMAL)
+        self.btn_detect_edge.config(state=tk.DISABLED)
+        self.btn_align.config(state=tk.DISABLED)
+
+        # Start pipeline in background thread
+        threading.Thread(target=self._full_pipeline_worker, daemon=True).start()
+
+    def _stop_pipeline(self):
+        """Stop the full pipeline."""
+        self.is_pipeline_running = False
+        self._set_status("Pipeline stopped by user")
+        self.btn_full_pipeline.config(state=tk.NORMAL)
+        self.btn_stop_pipeline.config(state=tk.DISABLED)
+        self.btn_detect_edge.config(state=tk.NORMAL)
+        self.btn_align.config(state=tk.NORMAL)
+
+    def _full_pipeline_worker(self):
+        """Worker thread for the full pipeline."""
+        try:
+            # SmartCamApi is not thread-safe -- pause background capture while
+            # the pipeline does its own synchronous camera captures.
+            self._capture_paused.set()
+            self._set_status("Starting full pipeline...")
+
+            # Step 0: Save current position as reference (0,0)
+            # The position where user clicks the button becomes the origin
+            self._set_status("Pipeline: Saving current position as origin (0,0)...")
+            logger.info("Full pipeline: Step 0 - Save current position as reference origin")
+            
+            try:
+                # Save current position - this becomes our (0,0) reference
+                status = self.stage.get_status()
+                current_pos = status.get("position", {})
+                self.pipeline_start_position = {
+                    "x": current_pos.get("x", 0.0),
+                    "y": current_pos.get("y", 0.0),
+                    "r": current_pos.get("r", 0.0)
+                }
+                logger.info(f"Saved origin position (where button was clicked): {self.pipeline_start_position}")
+                self._set_status(f"Pipeline: Origin set at ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})")
+                
+            except Exception as e:
+                logger.error(f"Failed to save origin position: {e}")
+                self.root.after(0, lambda: self._set_status(f"Pipeline error: {e}"))
+                return
+
+            # Check if pipeline was stopped
+            if not self.is_pipeline_running:
+                return
+
+            # Step 1: Detect edge (AT CURRENT POSITION - this is our (0,0))
+            self._set_status("Pipeline: Detecting edge at origin (current position)...")
+            logger.info("Full pipeline: Step 1 - Detect edge at current position (treated as 0,0)")
+
+            # Capture ONE fresh frame now that the background loop is paused so
+            # detection and alignment analyse the exact same image.
+            if self.camera is not None:
+                fresh = self.camera.capture()
+                if fresh is not None:
+                    with self._frame_lock:
+                        self._latest_frame = fresh
+                    self.current_image = fresh
+
+            # Run edge detection
+            theta, anchor, points = self._detect_edge_sync()
+
+            if theta is None:
+                self.root.after(0, lambda: self._set_status("Pipeline failed: Edge not detected"))
+                self.root.after(0, lambda: messagebox.showwarning("Pipeline Failed", "Could not detect edge"))
+                return
+
+            self._set_status(f"Pipeline: Edge detected at {theta:.1f}°")
+            logger.info(f"Edge detected: {theta:.1f}° at anchor {anchor}")
+
+            # Set the detected edge point as reference (0, 0)
+            # This defines the coordinate system where the edge is origin
+            self.edge_reference_point = anchor
+            logger.info(f"Set edge reference point as (0, 0): {anchor}")
+
+            # Keep edge visualization visible
+            self.edge_detected = True
+            self.edge_theta = theta
+            self.edge_anchor = anchor
+            self.edge_points = points
+            self.root.after(0, self._update_display)
+
+            # Check if pipeline was stopped
+            if not self.is_pipeline_running:
+                return
+
+            # Step 2: Auto-align (ROTATION ONLY - at current position, treated as (0,0))
+            self._set_status("Pipeline: Auto-aligning at origin (rotation only)...")
+            logger.info("Full pipeline: Step 2 - Auto-align at current position (rotation only)")
+
+            # Create alignment controller with color-based estimator
+            color_estimator = ColorEdgeEstimator(min_line_length=100)
+            controller = AutoAlignController(
+                camera=self.camera,
+                stage=self.stage,
+                rotation_axis="r",
+                estimator=color_estimator,
+                frame_is_rgb=False
+            )
+
+            # Progress callback
+            def progress_callback(iteration, angle, correction, converged):
+                if not self.is_pipeline_running:
+                    return
+                if converged:
+                    msg = f"Pipeline: Aligned at {angle:.1f}°"
+                else:
+                    msg = f"Pipeline: Iteration {iteration}, correction {correction:+.1f}°"
+                self.root.after(0, lambda: self._set_status(msg))
+
+            # Run alignment (only rotates, doesn't move X/Y)
+            success, message = controller.align(
+                max_iterations=10,
+                tolerance_deg=2.0,
+                progress_callback=progress_callback
+            )
+
+            if not success:
+                self.root.after(0, lambda: self._set_status(f"Pipeline: Alignment failed - {message}"))
+                logger.warning(f"Alignment failed: {message}")
+                # Continue anyway to return to origin
+            else:
+                self._set_status("Pipeline: Alignment successful!")
+                logger.info(f"Alignment successful: {message}")
+
+            # Check if pipeline was stopped
+            if not self.is_pipeline_running:
+                return
+
+            # Step 3: Return to origin position (where button was clicked)
+            # This is the only X/Y movement in the pipeline
+            self._set_status("Pipeline: Returning to origin position...")
+            logger.info("Full pipeline: Step 3 - Return to origin (where button was clicked)")
+
+            try:
+                # Return to saved starting position
+                if self.pipeline_start_position:
+                    self.stage.move_absolute("x", self.pipeline_start_position["x"], wait=True, timeout=60.0)
+                    self.stage.move_absolute("y", self.pipeline_start_position["y"], wait=True, timeout=60.0)
+                    self._set_status(f"Pipeline: Returned to ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})")
+                    logger.info(f"Returned to starting position: {self.pipeline_start_position}")
+                else:
+                    # If no starting position saved, don't move
+                    logger.info("No starting position saved, staying at current location")
+                    self._set_status("Pipeline: No return move needed")
+            except Exception as e:
+                logger.error(f"Failed to return to start position: {e}")
+                self.root.after(0, lambda: self._set_status(f"Pipeline error returning: {e}"))
+                return
+
+            # Pipeline complete
+            self._set_status("Pipeline complete! Edge detected, aligned, and returned to origin.")
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Pipeline Complete",
+                f"Full pipeline completed successfully!\n\n"
+                f"1. Saved current position as origin (0,0): ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})\n"
+                f"2. Detected edge at {self.edge_theta:.1f}° (no movement)\n"
+                f"3. Set edge point as reference (0, 0)\n"
+                f"4. Auto-aligned sample at origin (rotation only)\n"
+                f"5. Returned to origin position\n\n"
+                f"Edge reference: ({self.edge_reference_point[0]:.0f}, {self.edge_reference_point[1]:.0f})\n"
+                f"Origin position: ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})\n\n"
+                f"Edge overlay is still visible on the display.\n"
+                f"No X/Y movement occurred during edge detection or alignment."
+            ))
+
+        except Exception as e:
+            logger.error(f"Full pipeline error: {e}", exc_info=True)
+            self.root.after(0, lambda: self._set_status(f"Pipeline error: {e}"))
+        finally:
+            self._capture_paused.clear()
+            self.is_pipeline_running = False
+            self.root.after(0, lambda: self.btn_full_pipeline.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.btn_stop_pipeline.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.btn_detect_edge.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.btn_align.config(state=tk.NORMAL))
+
+    def _detect_edge_sync(self):
+        """Synchronous edge detection (for pipeline use).
+        
+        Returns
+        -------
+        theta : float or None
+            Edge angle in degrees
+        anchor : tuple or None
+            (x, y) anchor point
+        points : list or None
+            List of edge points
+        """
+        try:
+            # Get current frame
+            if self.current_image is None:
+                logger.error("No current image available for edge detection")
+                return None, None, None
+
+            frame_bgr = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2BGR)
+            h, w = frame_bgr.shape[:2]
+            logger.info(f"Pipeline edge detection on frame: {w}x{h}")
+
+            # Use color-based edge detection
+            logger.info("Starting color-based edge detection (HSV)...")
+            theta, anchor, points = detect_color_edge(frame_bgr)
+
+            if theta is not None:
+                self.edge_detected = True
+                self.edge_theta = theta
+                self.edge_anchor = anchor
+                self.edge_points = points if points else []
+                logger.info(
+                    f"Color edge detected: θ={theta:.1f}° at ({anchor[0]:.0f}, {anchor[1]:.0f}) "
+                    f"points={len(points)}"
+                )
+                return theta, anchor, points
+            else:
+                logger.warning("Color edge detection returned None")
+                return None, None, None
+
+        except Exception as e:
+            logger.error(f"Edge detection error: {e}", exc_info=True)
+            return None, None, None
 
     def _set_scan_start(self):
         """Set the current stage position as scan start."""

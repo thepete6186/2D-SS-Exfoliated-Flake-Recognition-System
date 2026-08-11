@@ -161,6 +161,53 @@ raster scanning.
 
 ---
 
+## 📐 Sample Auto-Alignment (`auto_align.py`)
+
+Coarse, camera- and stage-agnostic edge alignment: detects the dominant
+**long continuous edge** of the sample from live frames and rotates the
+Zolix R axis until the sample is visually squared with the X/Y axes.
+
+Architecture (clean separation):
+
+| Module | Responsibility |
+|--------|----------------|
+| `edge_estimation.py` | **Image processing only** — Canny + `HoughLinesP`, groups segments, merges collinear/continuous segments, and takes the *longest continuous edge* as THE edge (FIT of least-squares `fitLine` for sub-degree angle). Pure OpenCV/numpy; knows nothing about cameras or stages. |
+| `rotation_controller.py` | **Motion control only** — degree→pulse conversion and blocking R-axis moves. Uses the correct Zolix calibration **800 pulses/degree** (`0.00125` deg/step), not the old hardcoded 100. |
+| `auto_align.py` | **Orchestration** — capture → estimate → correct → rotate → repeat until the angle is within tolerance. Corrects in *canonical* (mod-90) space and locks a target axis, so it is stable against the 180° line ambiguity and 90° perpendicular-edge switches. |
+
+Run it:
+
+```bash
+# Hardware-free dry run: synthetic rectangle + SimulatedStage (converges)
+python auto_align.py --simulate --camera synthetic --sample-angle 30
+
+# Real lab camera + Zolix ZC300 stage
+python auto_align.py --port COM3
+
+# Webcam + simulated stage
+python auto_align.py --simulate --camera opencv --opencv-index 0
+```
+
+CLI options: `--port`, `--simulate`, `--camera smartcam|synthetic|opencv`,
+`--iterations`, `--sample-angle` (synthetic start misalignment),
+`--steps-per-degree` (default 800). If a positive stage move rotates the
+sample the *opposite* way in the image, pass `rotation_sign=-1` to
+`RotationController` (hardware calibration knob).
+
+Programmatic use:
+
+```python
+from auto_align import AutoAlignController
+
+controller = AutoAlignController(camera, stage)   # camera: any .capture() -> ndarray
+success, message = controller.align(max_iterations=10, tolerance_deg=2.0)
+```
+
+The GUI (`chip_edge_detector.py`, "Auto-Align Sample" button) drives this
+same controller.
+
+---
+
 ## 🧪 Testing
 
 Install test dependencies and run the suite:
