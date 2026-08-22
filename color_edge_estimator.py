@@ -42,10 +42,19 @@ class ColorEdgeEstimator:
     ----------
     min_line_length : int
         Minimum edge length in pixels (passed to detect_color_edge)
+    channel_order : str
+        "rgb" (default; SmartCamCamera returns RGB) or "bgr" (OpenCV/webcam).
+        The estimator converts to BGR internally because the HSV detector
+        expects BGR input.
     """
     
-    def __init__(self, min_line_length: int = 100):
+    def __init__(self, min_line_length: int = 100, channel_order: str = "rgb"):
+        if channel_order not in ("rgb", "bgr"):
+            raise ValueError(
+                f"channel_order must be 'rgb' or 'bgr', got {channel_order!r}"
+            )
         self.min_line_length = min_line_length
+        self.channel_order = channel_order
     
     def detect(self, frame: np.ndarray) -> Optional[ColorEdgeResult]:
         """
@@ -65,10 +74,13 @@ class ColorEdgeEstimator:
             logger.warning("Invalid frame provided to ColorEdgeEstimator")
             return None
         
-        # Convert RGB to BGR if needed (color_edge_detector expects BGR)
+        # Convert to BGR as needed (color_edge_detector expects BGR).
         if len(frame.shape) == 3 and frame.shape[2] == 3:
-            # Assume input might be RGB (from SmartCam), convert to BGR
-            frame_bgr = frame[:, :, ::-1].copy()
+            if self.channel_order == "rgb":
+                # camera returns RGB (SmartCam) -> flip to BGR
+                frame_bgr = frame[:, :, ::-1].copy()
+            else:
+                frame_bgr = frame
         else:
             frame_bgr = frame
         

@@ -65,17 +65,66 @@ STAGE_ROTATION_STEP_DEG = 0.00125  # degrees per step for R axis
 DEFAULT_PIXELS_PER_MM = 2650.0
 DEFAULT_PIXELS_PER_NM = DEFAULT_PIXELS_PER_MM / 1_000_000.0  # Convert to nm
 
+# Full-pipeline edge-midpoint centring parameters.
+# After the edge is detected the stage is moved so the detected edge
+# MIDPOINT sits on the optic axis (image centre) -- that machine position
+# becomes the pipeline origin (0,0).
+EDGE_CENTER_TOLERANCE_PX = 8.0     # stop recentring within this many px of centre
+EDGE_CENTER_MAX_RECENTER = 4       # max recentring stage moves per pipeline pass
+
+# Sign of stage moves needed to move a feature to the image centre.
+# +1.0 : moving the stage +x pushes the image of the sample +x (camera fixed,
+#        sample translates out from under it -> image follows the sample).
+# -1.0 : mirrors the axis (flip if the sample visibly moves the opposite way).
+PIXEL_STAGE_STEP_SIGN = 1.0
+
+
+def edge_offset_to_stage_steps(
+    dx_px: float,
+    dy_px: float,
+    pixels_per_nm: float,
+    step_size_um: float = STAGE_STEP_SIZE_UM,
+    direction: float = PIXEL_STAGE_STEP_SIGN,
+) -> Tuple[int, int]:
+    """Convert a pixel offset (dx, dy) to signed X/Y stage pulses.
+
+    The returned (sx, sy) are the RELATIVE stage moves that bring a feature
+    currently ``(dx, dy)`` pixels away from the image centre onto the centre.
+
+    Conversion chain: pixels -> nm (via calibrated px/nm) -> um ->
+    pulses (at `step_size_um` um/pulse).  ``direction`` reverses both axes
+    (hardware knob); it must be either +1.0 or -1.0.
+    """
+    if not pixels_per_nm or pixels_per_nm <= 0:
+        raise ValueError(f"pixels_per_nm must be > 0, got {pixels_per_nm!r}")
+    if step_size_um <= 0:
+        raise ValueError(f"step_size_um must be > 0, got {step_size_um!r}")
+    if direction not in (1.0, -1.0):
+        raise ValueError(f"direction must be +1.0 or -1.0, got {direction!r}")
+    nm_per_px = 1.0 / pixels_per_nm
+    um_per_px = nm_per_px / 1000.0
+    pulses_per_px = um_per_px / step_size_um
+    sx = int(round(direction * dx_px * pulses_per_px))
+    sy = int(round(direction * dy_px * pulses_per_px))
+    return sx, sy
+
 
 class ChipEdgeDetector:
     """
     Integrated chip edge detection with stage control.
     """
 
-    def __init__(self, root: tk.Tk, port: str, simulate: bool):
+    def __init__(self, root: tk.Tk, port: str, simulate: bool, rotation_sign: float = 1.0):
         self.root = root
         self.root.title("Chip Edge Detector - Automated Boundary Detection")
         self.root.geometry("1400x800")
         self.root.state("zoomed")
+
+        # Rotation-direction hardware knob (+1 / -1).  Flip if a positive stage
+        # R move rotates the sample the opposite way in the camera image.
+        if rotation_sign not in (1.0, -1.0):
+            raise ValueError(f"rotation_sign must be +1.0 or -1.0, got {rotation_sign!r}")
+        self.rotation_sign = float(rotation_sign)
 
         # Stage control
         self.port = port
@@ -125,6 +174,10 @@ class ChipEdgeDetector:
         # Full pipeline state
         self.is_pipeline_running = False
         self.pipeline_start_position = None  # Store starting position for return
+        # Machine (x, y) position that holds the detected edge midpoint on the
+        # optic axis -- this is the pipeline "origin (0,0)" that the pipeline
+        # returns to at the end.
+        self.pipeline_origin_position = None
 
         # FPS
         self.frame_count = 0
@@ -1096,8 +1149,10 @@ class ChipEdgeDetector:
             self._set_status("Starting auto-alignment...")
 
             # Create alignment controller with COLOR-BASED edge estimator
-            # This ensures the auto-alignment uses the same detector as the GUI
-            color_estimator = ColorEdgeEstimator(min_line_length=100)
+            # This ensures the auto-alignment uses the same detector as the GUI.
+            # SmartCam returns RGB, so channel_order="rgb" (converted to BGR
+            # inside ColorEdgeEstimator for the HSV detector).
+            color_estimator = ColorEdgeEstimator(min_line_length=100, channel_order="rgb")
             logger.info(f"Created ColorEdgeEstimator: {color_estimator}")
             logger.info(f"Estimator type: {type(color_estimator).__name__}")
             
@@ -1105,8 +1160,9 @@ class ChipEdgeDetector:
                 camera=self.camera,
                 stage=self.stage,
                 rotation_axis="r",
-                estimator=color_estimator,  # Use color-based detection
-                frame_is_rgb=False  # SmartCam returns RGB, but color_estimator handles conversion
+                estimator=color_estimator,
+                frame_is_rgb=True,           # SmartCam returns RGB
+                rotation_sign=self.rotation_sign,
             )
             
             logger.info(f"Controller estimator type: {type(controller.estimator).__name__}")
@@ -1235,10 +1291,11 @@ class ChipEdgeDetector:
             self._set_status(f"Pipeline: Edge detected at {theta:.1f}°")
             logger.info(f"Edge detected: {theta:.1f}° at anchor {anchor}")
 
-            # Set the detected edge point as reference (0, 0)
-            # This defines the coordinate system where the edge is origin
+            # Set the detected edge MIDPOINT as the pipeline reference.
+            # This point is what we physically bring to the optic axis, so that
+            # "edge middle = (0,0)" holds in the stage coordinate system.
             self.edge_reference_point = anchor
-            logger.info(f"Set edge reference point as (0, 0): {anchor}")
+            logger.info(f"Edge reference (mid) point: {anchor}")
 
             # Keep edge visualization visible
             self.edge_detected = True
@@ -1251,18 +1308,52 @@ class ChipEdgeDetector:
             if not self.is_pipeline_running:
                 return
 
+            # Step 1b: Physically move the stage so the edge midpoint sits on
+            # the optic axis (image centre).  THIS is the step that makes
+            # "edge middle = (0,0)": the machine position holding the midpoint
+            # on the optic axis is recorded as the origin the pipeline returns to.
+            self._set_status("Pipeline: Centering edge midpoint in view (X/Y move)...")
+            logger.info("Pipeline: Move stage so edge midpoint is at image centre")
+            centre_pos = self._recenter_edge_on_centre(max_iters=EDGE_CENTER_MAX_RECENTER)
+            if centre_pos is None:
+                # Recentring failed (no edge / no calibration).  Fall back to
+                # the click position as the origin and keep going, but warn.
+                centre_pos = (self.pipeline_start_position["x"],
+                              self.pipeline_start_position["y"])
+                self._set_status("Pipeline: Warning - could not centre edge midpoint; "
+                                 "using click position as origin")
+                logger.warning("Recentring failed; using click position as origin")
+            else:
+                self._set_status(
+                    f"Pipeline: Edge midpoint centred at ({centre_pos[0]:.0f}, "
+                    f"{centre_pos[1]:.0f}) - this machine position is now (0,0)")
+                logger.info("Pipeline origin (edge midpoint centred): %s", centre_pos)
+
+            self.pipeline_origin_position = {
+                "x": centre_pos[0],
+                "y": centre_pos[1],
+                "r": float(self.pipeline_start_position.get("r", 0.0)),
+            }
+
+            # Check if pipeline was stopped
+            if not self.is_pipeline_running:
+                return
+
             # Step 2: Auto-align (ROTATION ONLY - at current position, treated as (0,0))
             self._set_status("Pipeline: Auto-aligning at origin (rotation only)...")
             logger.info("Full pipeline: Step 2 - Auto-align at current position (rotation only)")
 
-            # Create alignment controller with color-based estimator
-            color_estimator = ColorEdgeEstimator(min_line_length=100)
+            # Create alignment controller with color-based estimator.
+            # SmartCam returns RGB, so channel_order="rgb" (the estimator
+            # converts to BGR internally for the HSV detector).
+            color_estimator = ColorEdgeEstimator(min_line_length=100, channel_order="rgb")
             controller = AutoAlignController(
                 camera=self.camera,
                 stage=self.stage,
                 rotation_axis="r",
                 estimator=color_estimator,
-                frame_is_rgb=False
+                frame_is_rgb=True,
+                rotation_sign=self.rotation_sign,
             )
 
             # Progress callback
@@ -1294,41 +1385,69 @@ class ChipEdgeDetector:
             if not self.is_pipeline_running:
                 return
 
-            # Step 3: Return to origin position (where button was clicked)
-            # This is the only X/Y movement in the pipeline
-            self._set_status("Pipeline: Returning to origin position...")
-            logger.info("Full pipeline: Step 3 - Return to origin (where button was clicked)")
+            # Step 2b: Re-centre the midpoint after rotation.  Rotation is about the
+            # optic axis so the midpoint should stay centred, but backlash /
+            # drift can move it; a cheap re-centre keeps the origin definition
+            # honest.
+            self._set_status("Pipeline: Re-centring edge midpoint after rotation...")
+            final_centre = self._recenter_edge_on_centre(max_iters=EDGE_CENTER_MAX_RECENTER)
+            if final_centre is not None:
+                self.pipeline_origin_position["x"] = final_centre[0]
+                self.pipeline_origin_position["y"] = final_centre[1]
+                logger.info("Final pipeline origin (edge midpoint): %s",
+                            self.pipeline_origin_position)
+
+            # Check if pipeline was stopped
+            if not self.is_pipeline_running:
+                return
+
+            # Step 3: Return to origin.  Origin = the machine position where the
+            # edge midpoint sits on the optic axis (the position we treat as
+            # (0,0)).  R is left at the aligned angle (that is the whole point
+            # of the rotation).
+            self._set_status("Pipeline: Returning to origin (edge midpoint position)...")
+            logger.info("Full pipeline: Step 3 - Return to pipeline origin %s",
+                        self.pipeline_origin_position)
 
             try:
-                # Return to saved starting position
-                if self.pipeline_start_position:
-                    self.stage.move_absolute("x", self.pipeline_start_position["x"], wait=True, timeout=60.0)
-                    self.stage.move_absolute("y", self.pipeline_start_position["y"], wait=True, timeout=60.0)
-                    self._set_status(f"Pipeline: Returned to ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})")
-                    logger.info(f"Returned to starting position: {self.pipeline_start_position}")
+                if self.pipeline_origin_position:
+                    self.stage.move_absolute(
+                        "x", self.pipeline_origin_position["x"], wait=True, timeout=60.0)
+                    self.stage.move_absolute(
+                        "y", self.pipeline_origin_position["y"], wait=True, timeout=60.0)
+                    self._set_status(
+                        f"Pipeline: Returned to origin "
+                        f"({self.pipeline_origin_position['x']:.0f}, "
+                        f"{self.pipeline_origin_position['y']:.0f})")
+                    logger.info("Returned to pipeline origin %s",
+                                self.pipeline_origin_position)
                 else:
-                    # If no starting position saved, don't move
-                    logger.info("No starting position saved, staying at current location")
+                    # If no origin saved, don't move
+                    logger.info("No origin position saved, staying at current location")
                     self._set_status("Pipeline: No return move needed")
             except Exception as e:
-                logger.error(f"Failed to return to start position: {e}")
+                logger.error(f"Failed to return to origin: {e}")
                 self.root.after(0, lambda: self._set_status(f"Pipeline error returning: {e}"))
                 return
 
             # Pipeline complete
             self._set_status("Pipeline complete! Edge detected, aligned, and returned to origin.")
+            px = self.pipeline_origin_position["x"] if self.pipeline_origin_position else 0.0
+            py = self.pipeline_origin_position["y"] if self.pipeline_origin_position else 0.0
             self.root.after(0, lambda: messagebox.showinfo(
                 "Pipeline Complete",
                 f"Full pipeline completed successfully!\n\n"
-                f"1. Saved current position as origin (0,0): ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})\n"
-                f"2. Detected edge at {self.edge_theta:.1f}° (no movement)\n"
-                f"3. Set edge point as reference (0, 0)\n"
-                f"4. Auto-aligned sample at origin (rotation only)\n"
-                f"5. Returned to origin position\n\n"
-                f"Edge reference: ({self.edge_reference_point[0]:.0f}, {self.edge_reference_point[1]:.0f})\n"
-                f"Origin position: ({self.pipeline_start_position['x']:.0f}, {self.pipeline_start_position['y']:.0f})\n\n"
-                f"Edge overlay is still visible on the display.\n"
-                f"No X/Y movement occurred during edge detection or alignment."
+                f"1. Detected edge at {self.edge_theta:.1f}° \n"
+                f"2. Centred edge midpoint on the optic axis (X/Y move)\n"
+                f"3. That machine position is now the origin (0,0)\n"
+                f"4. Auto-aligned sample (R rotation only)\n"
+                f"5. Re-centred after rotation\n"
+                f"6. Returned to origin (edge midpoint position)\n\n"
+                f"Origin position (edge midpoint on axis): ({px:.0f}, {py:.0f})\n"
+                f"Edge reference (image px): "
+                f"({self.edge_reference_point[0]:.0f}, {self.edge_reference_point[1]:.0f})\n\n"
+                f"The R axis is left at the aligned angle; the stage sits on "
+                f"(0,0) = edge middle."
             ))
 
         except Exception as e:
@@ -1385,6 +1504,139 @@ class ChipEdgeDetector:
         except Exception as e:
             logger.error(f"Edge detection error: {e}", exc_info=True)
             return None, None, None
+
+    @staticmethod
+    def pixels_per_nm_for_zoom(
+        calibration: Dict[float, float], zoom_level: float
+    ) -> float:
+        """Resolve pixels/nm for an ARBITRARY zoom level.
+
+        ``calibration`` maps preset zoom factors (1, 5, 10, 20, 50) to px/nm.
+        Mouse-wheel zoom produces in-between values (e.g. 0.9), so resolve by
+        scaling the NEAREST calibrated entry linearly -- px/nm is proportional
+        to zoom.  Falls back to the built-in default calibration when the
+        table has no usable entries.
+        """
+        if calibration:
+            # exact preset hit
+            if zoom_level in calibration and calibration[zoom_level] > 0:
+                return float(calibration[zoom_level])
+            # nearest calibrated entry, scaled linearly
+            try:
+                nearest = min(calibration.keys(), key=lambda k: abs(k - zoom_level))
+            except ValueError:
+                nearest = None
+            if nearest is not None and calibration[nearest] > 0:
+                return float(calibration[nearest]) * (float(zoom_level) / float(nearest))
+        # last resort: factory default (px/nm at 1x) scaled to this zoom
+        return DEFAULT_PIXELS_PER_NM * float(zoom_level)
+
+    def _current_pulses_per_pixel(self) -> Optional[float]:
+        """Stage pulses per image pixel at the current zoom level.
+
+        Works for ANY zoom factor (mouse-wheel zoom produces e.g. 0.9x):
+        the calibration is resolved by scaling the nearest calibrated preset
+        linearly, falling back to the factory default.
+        """
+        pixels_per_nm = self.pixels_per_nm_for_zoom(self.calibration, self.zoom_level)
+        if not pixels_per_nm or pixels_per_nm <= 0:
+            logger.warning("No usable calibration for zoom %.2fx", self.zoom_level)
+            return None
+        nm_per_px = 1.0 / pixels_per_nm
+        um_per_px = nm_per_px / 1000.0
+        return um_per_px / STAGE_STEP_SIZE_UM
+
+    def _recenter_edge_on_centre(self, max_iters: int = EDGE_CENTER_MAX_RECENTER) -> Optional[Tuple[float, float]]:
+        """Move the stage so the detected edge's MIDPOINT lands on the optic axis.
+
+        Loop: capture frame -> detect edge -> compute how far the midpoint is
+        from the image centre -> convert that pixel offset to X/Y pulses ->
+        move the stage -> repeat until the midpoint is within the tolerance or
+        the iteration budget is spent.
+
+        Returns
+        -------
+        tuple or None
+            ``(x_pulses, y_pulses)`` machine position that puts the midpoint
+            at the image centre, or None if the edge was lost / the stage or
+            calibration is unavailable.
+        """
+        if self.camera is None or self.stage is None:
+            return None
+
+        # Resolve calibration for the CURRENT zoom (works for arbitrary
+        # mouse-wheel zoom factors like 0.9x).
+        pixels_per_nm = self.pixels_per_nm_for_zoom(self.calibration, self.zoom_level)
+        if not pixels_per_nm or pixels_per_nm <= 0:
+            logger.warning("No usable calibration for zoom %.2fx", self.zoom_level)
+            return None
+        pulses_per_px = (1.0 / pixels_per_nm / 1000.0) / STAGE_STEP_SIZE_UM
+
+        try:
+            pos = self.stage.get_position()
+            x = float(pos.get("x", 0.0))
+            y = float(pos.get("y", 0.0))
+        except Exception as e:  # pragma: no cover - hardware path
+            logger.error("Failed to read stage position during recentring: %s", e)
+            return None
+
+        for i in range(1, int(max_iters) + 1):
+            if not self.is_pipeline_running:
+                return None
+
+            # Capture a fresh frame (background capture is paused).
+            try:
+                frame = self.camera.capture()
+            except Exception as exc:  # pragma: no cover - hardware path
+                logger.error("Recentring capture failed: %s", exc)
+                break
+            if frame is None:
+                logger.warning("Recentring iter %d: no frame captured", i)
+                break
+            with self._frame_lock:
+                self._latest_frame = frame
+            self.current_image = frame
+
+            theta, anchor, _points = self._detect_edge_sync()
+            if theta is None or anchor is None:
+                logger.warning("Recentring iter %d: edge not found", i)
+                break
+
+            h, w = frame.shape[:2]
+            cx = w / 2.0
+            cy = h / 2.0
+            dx_px = anchor[0] - cx
+            dy_px = anchor[1] - cy
+            dist_px = float(np.hypot(dx_px, dy_px))
+
+            logger.info(
+                "Recentring iter %d: midpoint offset (%.0f, %.0f) px (dist %.1f px)",
+                i, dx_px, dy_px, dist_px,
+            )
+            if dist_px <= EDGE_CENTER_TOLERANCE_PX:
+                logger.info("Edge midpoint already centred (%.1f px)", dist_px)
+                break
+
+            steps = edge_offset_to_stage_steps(
+                dx_px, dy_px, pixels_per_nm,
+                STAGE_STEP_SIZE_UM, PIXEL_STAGE_STEP_SIGN,
+            )
+            sx, sy = steps
+            if sx == 0 and sy == 0:
+                break  # sub-step correction -- nothing more to do
+            logger.info("Recentring iter %d: moving X%+d Y%+d pulses", i, sx, sy)
+            if sx != 0:
+                self.stage.move_relative("x", sx, wait=True, timeout=60.0)
+            if sy != 0:
+                self.stage.move_relative("y", sy, wait=True, timeout=60.0)
+            x += float(sx)
+            y += float(sy)
+        else:
+            # loop exhausted without a break; report the last position anyway
+            pass
+
+        logger.info("Edge midpoint centred at stage (%s, %s) pulses", f"{x:.0f}", f"{y:.0f}")
+        return (x, y)
 
     def _set_scan_start(self):
         """Set the current stage position as scan start."""
@@ -1795,10 +2047,16 @@ def main():
     parser = argparse.ArgumentParser(description="Chip Edge Detector")
     parser.add_argument("--port", default="COM3", help="Stage serial port (default COM3)")
     parser.add_argument("--simulate", action="store_true", help="Use SimulatedStage")
+    parser.add_argument(
+        "--rotation-sign", type=float, default=1.0,
+        help="+1 or -1 (default +1): flip if a positive R move rotates the sample "
+             "the opposite way in the camera image",
+    )
     args = parser.parse_args()
 
     root = tk.Tk()
-    app = ChipEdgeDetector(root, port=args.port, simulate=args.simulate)
+    app = ChipEdgeDetector(root, port=args.port, simulate=args.simulate,
+                           rotation_sign=args.rotation_sign)
     root.protocol("WM_DELETE_WINDOW", app.cleanup)
     root.mainloop()
 

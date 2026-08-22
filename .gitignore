@@ -31,3 +31,10 @@ transfer-stage-control
 
 # IDE/workspace files
 *.code-workspace
+
+# Runtime logs / caches from local test runs
+*.log
+.pytest_cache/
+_ce.log
+_ce_err.log
+_run_*.log

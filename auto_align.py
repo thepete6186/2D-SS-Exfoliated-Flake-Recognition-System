@@ -31,6 +31,7 @@ CLI:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Callable, Optional, Tuple
 
 from edge_estimation import EdgeAngleEstimator
@@ -81,6 +82,9 @@ class AutoAlignController:
         Override the default estimator (tests can inject a stub).
     rotation : RotationController, optional
         Override the default rotation controller (tests can inject a stub).
+    rotation_sign : float
+        +1 or -1. Forwarded to RotationController: flip to -1 if a positive
+        stage R move rotates the sample the opposite way in the camera image.
     """
 
     def __init__(
@@ -92,6 +96,7 @@ class AutoAlignController:
         frame_is_rgb: bool = True,
         estimator: Optional[EdgeAngleEstimator] = None,
         rotation: Optional[RotationController] = None,
+        rotation_sign: float = 1.0,
     ) -> None:
         self.camera = camera
         self.stage = stage
@@ -104,7 +109,10 @@ class AutoAlignController:
             )
         if rotation is None:
             rotation = RotationController(
-                stage, axis=rotation_axis, steps_per_degree=steps_per_degree
+                stage,
+                axis=rotation_axis,
+                steps_per_degree=steps_per_degree,
+                rotation_sign=rotation_sign,
             )
         self.estimator = estimator
         self.rotation = rotation
@@ -121,16 +129,38 @@ class AutoAlignController:
     # ------------------------------------------------------------------
     # Step 1: capture
     # ------------------------------------------------------------------
-    def capture_frame(self):
-        """Capture one frame from the camera (or None on failure)."""
-        try:
-            frame = self.camera.capture()
-        except Exception as exc:  # pragma: no cover - hardware path
-            logger.error("Frame capture failed: %s", exc)
-            return None
-        if frame is None:
-            logger.error("Failed to capture frame from camera")
-        return frame
+    def capture_frame(
+        self, max_retries: int = 3, retry_delay_s: float = 0.7
+    ):
+        """Capture one frame from the camera, retrying on transient failures.
+
+        The SmartCam sequence-acquisition path occasionally returns no frame
+        or raises on a single call (USB timing); a retry recovers without
+        aborting the whole alignment.  Returns the frame, or None after
+        ``max_retries`` consecutive failures.
+        """
+        for attempt in range(1, int(max_retries) + 1):
+            try:
+                frame = self.camera.capture()
+            except Exception as exc:  # pragma: no cover - hardware path
+                logger.error(
+                    "Frame capture failed (attempt %d/%d): %s",
+                    attempt, max_retries, exc,
+                )
+                frame = None
+            if frame is not None:
+                return frame
+            logger.warning(
+                "Camera returned no frame (attempt %d/%d)%s",
+                attempt, max_retries,
+                "" if attempt == max_retries else " -- retrying",
+            )
+            if attempt < max_retries:
+                time.sleep(float(retry_delay_s))
+        logger.error(
+            "Failed to capture frame from camera after %d attempts", max_retries
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Step 2: estimate
